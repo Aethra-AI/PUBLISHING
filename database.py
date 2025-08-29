@@ -1,187 +1,208 @@
 # -*- coding: utf-8 -*-
-import sqlite3
-from datetime import datetime
+import os
+import mysql.connector
+from mysql.connector import pooling
+from dotenv import load_dotenv
+
+# Carga las variables de entorno desde el archivo .env
+# (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, DB_PORT)
+load_dotenv()
 
 class DatabaseManager:
-    def __init__(self, db_path="marketing_tool.db"):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row # Permite acceder a las columnas por nombre
-        self.setup_tables()
-
-    def setup_tables(self):
-        cursor = self.conn.cursor()
-        
-        # --- TABLAS DE CONTENIDO ---
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS texts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                ai_tags TEXT,
-                usage_count INTEGER DEFAULT 0
-            );
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS images (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT NOT NULL UNIQUE,
-                manual_tags TEXT
-            );
-        """)
-
-        # --- TABLAS DE DESTINO ---
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS groups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT NOT NULL UNIQUE,
-                tags TEXT
-            );
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                page_url TEXT NOT NULL UNIQUE
-            );
-        """)
-        
-        # --- TABLAS DE REGISTRO DE USO ---
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS group_image_usage_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                image_id INTEGER,
-                group_id INTEGER,
-                timestamp DATETIME,
-                FOREIGN KEY(image_id) REFERENCES images(id),
-                FOREIGN KEY(group_id) REFERENCES groups(id)
-            );
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS group_text_usage_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text_id INTEGER,
-                group_id INTEGER,
-                timestamp DATETIME,
-                FOREIGN KEY(text_id) REFERENCES texts(id),
-                FOREIGN KEY(group_id) REFERENCES groups(id)
-            );
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS page_image_usage (
-                page_id INTEGER,
-                image_id INTEGER,
-                PRIMARY KEY (page_id, image_id),
-                FOREIGN KEY(page_id) REFERENCES pages(id),
-                FOREIGN KEY(image_id) REFERENCES images(id)
-            );
-        """)
-
-        # --- TABLAS DE OPERACIONES ---
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS scheduled_posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                page_id INTEGER,
-                publish_at DATETIME NOT NULL,
-                text_content TEXT,
-                image_id INTEGER,
-                status TEXT DEFAULT 'pending', /* pending, processing, completed, failed */
-                FOREIGN KEY(page_id) REFERENCES pages(id),
-                FOREIGN KEY(image_id) REFERENCES images(id)
-            );
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS publication_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
-                status TEXT NOT NULL, /* Success, Failed */
-                target_type TEXT NOT NULL, /* group, page */
-                target_url TEXT,
-                text_content TEXT,
-                image_path TEXT,
-                published_post_url TEXT
-            );
-        """)
-
-        # --- MIGRACIÓN: Añadir columna usage_count a texts si no existe ---
+    """
+    Gestiona toda la interacción con la base de datos MariaDB/MySQL.
+    Utiliza un pool de conexiones para un rendimiento eficiente en un entorno de servidor web.
+    """
+    def __init__(self):
+        """
+        Inicializa el pool de conexiones a la base de datos y crea las tablas si no existen.
+        """
         try:
-            # Intenta seleccionar la columna para ver si existe.
-            cursor.execute("SELECT usage_count FROM texts LIMIT 1")
-        except sqlite3.OperationalError:
-            # Si no existe, la añade.
-            print("Realizando migración: Añadiendo 'usage_count' a la tabla 'texts'...") # <-- LÍNEA MODIFICADA
-            cursor.execute("ALTER TABLE texts ADD COLUMN usage_count INTEGER DEFAULT 0")
+            self.pool = mysql.connector.pooling.MySQLConnectionPool(
+                pool_name="marketing_pool",
+                pool_size=5, # Número de conexiones a mantener abiertas. 5 es un buen punto de partida.
+                host=os.getenv("DB_HOST", "localhost"),
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASSWORD"),
+                database=os.getenv("DB_NAME"),
+                port=os.getenv("DB_PORT", 3306)
+            )
+            print("✅ Pool de conexiones a MariaDB creado exitosamente.")
+            self.setup_tables()
+        except mysql.connector.Error as err:
+            print(f"❌ Error crítico al conectar con MariaDB: {err}")
+            # Si no se puede conectar a la BD, la aplicación no puede funcionar.
+            exit(1)
 
-        # --- MIGRACIÓN: Añadir columna error_details a publication_log si no existe ---
+    def execute_query(self, query, params=(), commit=False):
+        """
+        Ejecuta una consulta que no devuelve filas (INSERT, UPDATE, DELETE).
+        Args:
+            query (str): La consulta SQL con placeholders (%s).
+            params (tuple): Los parámetros para la consulta.
+            commit (bool): Si es True, confirma la transacción.
+        Returns:
+            Cursor: El cursor de la base de datos después de la ejecución.
+        """
+        # Obtiene una conexión del pool.
+        conn = self.pool.get_connection()
+        cursor = conn.cursor()
         try:
-            # Intenta seleccionar la columna para ver si existe.
-            cursor.execute("SELECT error_details FROM publication_log LIMIT 1")
-        except sqlite3.OperationalError:
-            # Si no existe, la añade.
-            print("Realizando migración: Añadiendo 'error_details' a la tabla 'publication_log'...")
-            cursor.execute("ALTER TABLE publication_log ADD COLUMN error_details TEXT")
-
-        self.conn.commit()
-        
-    # --- MÉTODOS PARA OBTENER DATOS ---
-    def get_all_data(self):
-        cursor = self.conn.cursor()
-        
-        texts = [dict(row) for row in cursor.execute("SELECT * FROM texts ORDER BY id DESC").fetchall()]
-        images = [dict(row) for row in cursor.execute("SELECT * FROM images ORDER BY id DESC").fetchall()]
-        groups = [dict(row) for row in cursor.execute("SELECT * FROM groups ORDER BY id DESC").fetchall()]
-        pages = [dict(row) for row in cursor.execute("SELECT * FROM pages ORDER BY id DESC").fetchall()]
-        
-        # Obtener scheduled posts con el nombre de la página
-        scheduled_posts = [dict(row) for row in cursor.execute("""
-            SELECT sp.*, p.name as page_name, i.path as image_path
-            FROM scheduled_posts sp
-            JOIN pages p ON sp.page_id = p.id
-            LEFT JOIN images i ON sp.image_id = i.id
-            ORDER BY sp.publish_at ASC
-        """).fetchall()]
-
-        return {
-            "texts": texts,
-            "images": images,
-            "groups": groups,
-            "pages": pages,
-            "scheduled_posts": scheduled_posts
-        }
-
-    # --- MÉTODOS PARA ELIMINAR DATOS ---
-    def delete_item(self, table, item_id):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(f"DELETE FROM {table} WHERE id = ?", (item_id,))
-            self.conn.commit()
-            return {"success": True}
-        except Exception as e:
-            return {"success": False, "message": str(e)}
-
-    # --- Métodos específicos para la lógica de la aplicación ---
-    
-    # ... (Se añadirán más métodos según los necesite AppLogic) ...
-
-    def execute_query(self, query, params=()):
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        self.conn.commit()
-        return cursor
+            cursor.execute(query, params)
+            if commit:
+                conn.commit()
+            return cursor
+        except mysql.connector.Error as err:
+            print(f"❌ Error de base de datos: {err}")
+            conn.rollback() # Revierte los cambios en caso de error.
+            return None
+        finally:
+            cursor.close()
+            conn.close() # Devuelve la conexión al pool.
 
     def fetch_all(self, query, params=()):
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        return [dict(row) for row in cursor.fetchall()]
+        """
+        Ejecuta una consulta y devuelve todas las filas encontradas como una lista de diccionarios.
+        """
+        conn = self.pool.get_connection()
+        # dictionary=True es muy útil para devolver filas como {'columna': 'valor'}
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute(query, params)
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
 
     def fetch_one(self, query, params=()):
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        """
+        Ejecuta una consulta y devuelve la primera fila encontrada como un diccionario.
+        """
+        conn = self.pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute(query, params)
+            return cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+            
+    def setup_tables(self):
+        """
+        Define y crea todo el esquema de la base de datos para el sistema multi-inquilino.
+        Se ejecuta una sola vez al iniciar la aplicación.
+        """
+        # Se usa `ENGINE=InnoDB` porque es necesario para soportar claves foráneas.
+        # `ON DELETE CASCADE` es la clave para la gestión de clientes: si un cliente se elimina,
+        # todos sus datos asociados (textos, imágenes, etc.) se eliminan automáticamente.
+        
+        # 1. Tabla de Clientes: El núcleo del sistema multi-inquilino.
+        create_clients_table = """
+        CREATE TABLE IF NOT EXISTS clients (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            email VARCHAR(255) NOT NULL UNIQUE,
+            password_hash VARCHAR(255) NOT NULL,
+            plan VARCHAR(50) NOT NULL DEFAULT 'free',
+            trial_expires_at DATETIME NULL,
+            publications_this_month INT NOT NULL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB;
+        """
 
-# Instancia global para ser usada por toda la aplicación
+        # 2. Tablas de Contenido: Cada registro pertenece a un cliente.
+        create_texts_table = """
+        CREATE TABLE IF NOT EXISTS texts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id INT NOT NULL,
+            content TEXT NOT NULL,
+            ai_tags TEXT,
+            usage_count INT DEFAULT 0,
+            FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB;
+        """
+        
+        create_images_table = """
+        CREATE TABLE IF NOT EXISTS images (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id INT NOT NULL,
+            path VARCHAR(512) NOT NULL,
+            manual_tags TEXT,
+            UNIQUE KEY (client_id, path(255)),
+            FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB;
+        """
+
+        # 3. Tablas de Destinos: También pertenecen a un cliente.
+        create_groups_table = """
+        CREATE TABLE IF NOT EXISTS groups (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id INT NOT NULL,
+            url VARCHAR(512) NOT NULL,
+            tags TEXT,
+            UNIQUE KEY (client_id, url(255)),
+            FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB;
+        """
+        
+        create_pages_table = """
+        CREATE TABLE IF NOT EXISTS pages (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id INT NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            page_url VARCHAR(512) NOT NULL,
+            UNIQUE KEY (client_id, page_url(255)),
+            FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB;
+        """
+        
+        # 4. Tablas de Operaciones y Logs
+        create_scheduled_posts_table = """
+        CREATE TABLE IF NOT EXISTS scheduled_posts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id INT NOT NULL,
+            page_id INT,
+            publish_at DATETIME NOT NULL,
+            text_content TEXT,
+            image_id INT,
+            status VARCHAR(50) DEFAULT 'pending',
+            FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB;
+        """
+
+        create_publication_log_table = """
+        CREATE TABLE IF NOT EXISTS publication_log (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id INT NOT NULL,
+            timestamp DATETIME NOT NULL,
+            status VARCHAR(50) NOT NULL,
+            target_type VARCHAR(50) NOT NULL,
+            target_url VARCHAR(512),
+            text_content TEXT,
+            image_path VARCHAR(512),
+            published_post_url VARCHAR(512),
+            error_details TEXT,
+            FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB;
+        """
+
+        # Lista de todos los comandos de creación de tablas
+        commands = [
+            create_clients_table,
+            create_texts_table,
+            create_images_table,
+            create_groups_table,
+            create_pages_table,
+            create_scheduled_posts_table,
+            create_publication_log_table
+        ]
+        
+        print("🔧 Verificando y creando el esquema de la base de datos...")
+        for command in commands:
+            self.execute_query(command, commit=True)
+        print("✅ Esquema de la base de datos listo.")
+
+# --- Instancia Global ---
+# Se crea una única instancia del gestor para que toda la aplicación la reutilice.
 db_manager = DatabaseManager()
+

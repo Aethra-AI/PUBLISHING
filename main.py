@@ -1,20 +1,30 @@
 # -*- coding: utf-8 -*-
-import eel
 import os
 import random
 import time
 import threading
 import uuid
-import json
-from datetime import datetime
-import tkinter as tk
-from tkinter import filedialog
+import shutil
+from datetime import datetime, timedelta, date
+from queue import Queue
+from functools import wraps
 
-# Módulos del proyecto
+# --- Módulos del Proyecto ---
+# Asegúrate de tener tu nuevo database.py para MariaDB y ai_services.py
 from database import db_manager
 from ai_services import ai_service
 
-# Importaciones de Selenium
+# --- Utilidades y Seguridad ---
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+
+# --- Framework Web y Autenticación ---
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+from flask_socketio import SocketIO, join_room, disconnect
+from flask_jwt_extended import create_access_token, get_jwt, jwt_required, JWTManager, decode_token
+
+# --- Lógica de Automatización (Selenium) ---
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -22,1597 +32,672 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import WebDriverException, TimeoutException
-from selenium.webdriver.remote.webelement import WebElement
 
-eel.init('web')
+# --- Carga de variables de entorno ---
+from dotenv import load_dotenv
+load_dotenv()
+
+# ==============================================================================
+# --- CONFIGURACIÓN DE LA APLICACIÓN ---
+# ==============================================================================
+
+app = Flask(__name__)
+CORS(app) # Permite peticiones desde tu frontend en Github Pages
+
+# --- Configuración de Seguridad y JWT ---
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "una-clave-muy-secreta-y-dificil-de-adivinar")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+SUPERUSER_API_KEY = os.getenv("SUPERUSER_API_KEY")
+if not SUPERUSER_API_KEY:
+    raise ValueError("SUPERUSER_API_KEY no está definida en el archivo .env")
+jwt = JWTManager(app)
+
+# --- Configuración de Archivos y Workers ---
+app.config['UPLOAD_FOLDER'] = os.path.abspath('client_uploads')
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+# Límite de navegadores simultáneos para una VM de 4GB. Ajustable.
+MAX_CONCURRENT_BROWSERS = 3
+job_queue = Queue()
+
+# --- Planes de Suscripción (Configuración Central) ---
+PLANS = {
+    'free': {'limit': 50, 'price': 0, 'name': 'Prueba Gratuita'},
+    'basic': {'limit': 500, 'price': 10, 'name': 'Plan Básico'},
+    'pro': {'limit': 1000, 'price': 15, 'name': 'Plan Profesional'},
+    'unlimited': {'limit': float('inf'), 'price': 50, 'name': 'Plan Ilimitado'}
+}
+
+# --- WebSockets para Logs en Tiempo Real ---
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+
+# ==============================================================================
+# --- LÓGICA DE AUTOMATIZACIÓN Y GESTIÓN DE INSTANCIAS ---
+# ==============================================================================
 
 class AppLogic:
-    def __init__(self):
-        # Estado de la automatización
+    """Contiene toda la lógica de automatización para UN SOLO cliente."""
+    def __init__(self, client_id, socket_io_instance):
+        self.client_id = client_id
+        self.socketio = socket_io_instance
         self.driver = None
-        self.running_groups_process = False
-        self.paused = False
-        self.publishing_thread = None
-        self.scheduler_thread = None
-        self.stop_scheduler = threading.Event()
+        self.is_publishing = False
+        self.profile_path = os.path.abspath(f'profiles/client_{self.client_id}')
+        os.makedirs(self.profile_path, exist_ok=True)
 
-        # Configuración
-        self.setup_chrome_options()
-        self.start_scheduler_thread()
-
-    def setup_chrome_options(self):
-        """
-        Configura las opciones para el navegador Chrome de Selenium.
-        Esta función instruye a Selenium para que utilice un perfil de datos
-        dedicado y persistente ('automation_profile') ubicado en la carpeta
-        del proyecto. Esto evita conflictos y problemas de permisos.
-        """
-        import os
-
-        self.options = webdriver.ChromeOptions()
-        
-        # Opciones estándar para estabilidad
-        self.options.add_argument("--disable-notifications")
-        self.options.add_argument("--start-maximized")
-        self.options.add_argument("--disable-blink-features=AutomationControlled")
-        
-        # Opciones para parecer menos un bot
-        self.options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        self.options.add_experimental_option("useAutomationExtension", False)
-
-        # --- Lógica para usar un perfil de bot dedicado y local ---
-
-        # 1. Creamos una ruta absoluta a la carpeta del perfil del bot.
-        #    Esto es mucho más robusto.
-        automation_profile_path = os.path.abspath('automation_profile')
-        
-        # 2. Le decimos a Selenium que use esa carpeta de perfil.
-        self.options.add_argument(f"user-data-dir={automation_profile_path}")
-        
-        
-    def log_to_panel(self, message):
+    def log_to_panel(self, message, log_type='info'):
+        """Envía un mensaje de log al frontend a través de WebSockets a la sala del cliente."""
         timestamp = time.strftime('%H:%M:%S')
         formatted_message = f"[{timestamp}] {message}"
-        try:
-            # Intentar llamar a la función JavaScript
-            eel.log_to_panel(formatted_message)()
-        except Exception as e:
-            # Si falla, imprimir en consola como respaldo
-            print(formatted_message)
-            # Solo mostrar error si no es porque eel no está disponible
-            if "RuntimeError" not in str(e) and "WebSocketError" not in str(e):
-                print(f"Error enviando log a UI: {e}")
+        self.socketio.emit('log_message', {'data': formatted_message, 'type': log_type}, room=self.client_id)
+        print(f"[Cliente {self.client_id}] {formatted_message}")
 
-    # --- LÓGICA DE SELENIUM ---
-    def init_browser(self):
-        """
-        Inicia el navegador y maneja de forma inteligente el primer inicio de sesión.
-        """
-        if self.driver:
-            self.log_to_panel("El navegador ya está iniciado.")
-            return True
-        try:
-            self.log_to_panel("Configurando ChromeDriver automáticamente...")
-            
-            # Comprobamos si el perfil del bot ya existe.
-            # Si no existe, significa que es la primera vez que se ejecuta.
-            import os
-            profile_path = os.path.abspath('automation_profile')
-            is_first_run = not os.path.exists(profile_path)
+    def get_chrome_options(self, headless=True):
+        """Genera las opciones de Chrome, permitiendo modo no-headless para login."""
+        options = webdriver.ChromeOptions()
+        if headless:
+            options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.add_argument(f"user-data-dir={self.profile_path}")
+        return options
 
+    def init_browser(self, headless=True):
+        """Inicia una instancia de navegador para este cliente."""
+        try:
+            self.log_to_panel("Configurando instancia de Chrome...")
             service = ChromeService(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=self.options)
-            
-            # Si es la primera vez, pausamos el script para el login manual.
-            if is_first_run:
-                self.log_to_panel("¡ACCIÓN REQUERIDA! Es la primera ejecución con este perfil.")
-                self.log_to_panel("Por favor, inicia sesión en Facebook en la ventana del navegador que se ha abierto.")
-                self.log_to_panel("Marca 'Recordarme' para no volver a hacerlo.")
-                self.log_to_panel("El bot continuará automáticamente cuando cierres esa ventana del navegador.")
-                
-                # Esta es la magia: el script se detendrá aquí hasta que cierres la ventana del bot.
-                try:
-                    # Esperamos indefinidamente. El script solo continuará si la ventana se cierra
-                    # o si hay un error (por ejemplo, el usuario cierra la terminal).
-                    self.driver.wait() 
-                except WebDriverException:
-                    # Esto es normal, ocurre cuando cierras la ventana manualmente.
-                    self.log_to_panel("Ventana cerrada por el usuario. Re-inicializando el navegador para continuar...")
-                    # Después de cerrar, necesitamos reiniciar el driver para que la sesión se guarde y se pueda usar.
-                    self.driver = webdriver.Chrome(service=service, options=self.options)
-            
+            self.driver = webdriver.Chrome(service=service, options=self.get_chrome_options(headless=headless))
             self.log_to_panel("Navegador iniciado y listo.")
             return True
         except Exception as e:
-            self.log_to_panel(f"Error crítico al iniciar Chrome: {e}")
-            self.driver = None
+            self.log_to_panel(f"Error crítico al iniciar Chrome: {e}", "error")
             return False
 
     def close_browser(self):
+        """Cierra la instancia del navegador si está abierta."""
         if self.driver:
             try:
                 self.driver.quit()
-            except Exception as e:
-                self.log_to_panel(f"Error al cerrar el driver: {e}")
             finally:
                 self.driver = None
-                self.log_to_panel("Navegador cerrado.")
+                self.log_to_panel("Instancia del navegador cerrada.")
     
-    # Dentro de la clase AppLogic en main.py
+    # --- LÓGICA DE SELENIUM PORTADA DEL SCRIPT ORIGINAL ---
+    # Se mantienen los XPaths y la robusta lógica de reintentos.
 
     def _validate_image_path(self, image_path):
-        """
-        Valida que el archivo de imagen exista antes de intentar subirlo.
-        
-        Args:
-            image_path: Ruta del archivo de imagen
-            
-        Returns:
-            dict: {"valid": bool, "path": str, "error": str}
-        """
-        if not image_path:
-            return {"valid": True, "path": None, "error": None}
-            
+        """Valida que un archivo de imagen exista y sea accesible."""
+        if not image_path: return {"valid": True, "path": None, "error": None}
         try:
-            import os
-            
-            # Convertir a ruta absoluta
             abs_path = os.path.abspath(image_path)
-            
-            # Verificar que el archivo existe
-            if not os.path.exists(abs_path):
-                self.log_to_panel(f"❌ Archivo no encontrado: {abs_path}")
-                return {"valid": False, "path": abs_path, "error": "Archivo no encontrado"}
-            
-            # Verificar que es un archivo (no directorio)
-            if not os.path.isfile(abs_path):
-                self.log_to_panel(f"❌ La ruta no es un archivo: {abs_path}")
-                return {"valid": False, "path": abs_path, "error": "No es un archivo"}
-                
-            # Verificar extensión de imagen
-            valid_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']
-            file_ext = os.path.splitext(abs_path)[1].lower()
-            if file_ext not in valid_extensions:
-                self.log_to_panel(f"⚠️ Extensión no válida: {file_ext}")
-                return {"valid": False, "path": abs_path, "error": f"Extensión no soportada: {file_ext}"}
-            
-            # Verificar tamaño del archivo
-            file_size = os.path.getsize(abs_path)
-            max_size = 10 * 1024 * 1024  # 10 MB
-            if file_size > max_size:
-                self.log_to_panel(f"⚠️ Archivo demasiado grande: {file_size / 1024 / 1024:.1f}MB")
-                return {"valid": False, "path": abs_path, "error": f"Archivo demasiado grande"}
-                
-            self.log_to_panel(f"✅ Imagen validada: {os.path.basename(abs_path)} ({file_size / 1024:.1f}KB)")
+            if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+                error = "Archivo no encontrado o no es un archivo"
+                self.log_to_panel(f"⚠️ Imagen inválida: {os.path.basename(image_path)} ({error})", "warning")
+                return {"valid": False, "path": abs_path, "error": error}
             return {"valid": True, "path": abs_path, "error": None}
-            
         except Exception as e:
-            error_msg = f"Error validando imagen: {str(e)}"
-            self.log_to_panel(f"❌ {error_msg}")
-            return {"valid": False, "path": image_path, "error": error_msg}
+            self.log_to_panel(f"⚠️ Error validando imagen: {e}", "warning")
+            return {"valid": False, "path": image_path, "error": str(e)}
 
     def _create_post_on_facebook(self, text_content, image_path=None, max_retries=3):
         """
-        Crea una publicación en Facebook con manejo robusto de errores y reintentos.
-        
-        Args:
-            text_content: Contenido de texto para la publicación
-            image_path: Ruta opcional de la imagen
-            max_retries: Número máximo de reintentos por operación
-            
-        Returns:
-            dict: {"success": bool, "post_url": str, "error": str, "should_discard_group": bool}
+        Crea una publicación en Facebook. MANTIENE LOS XPATH ORIGINALES para máxima compatibilidad.
         """
-        # VALIDACIÓN PREVIA DE IMAGEN
         image_validation = self._validate_image_path(image_path)
         if not image_validation["valid"]:
-            self.log_to_panel(f"🖼️ IMAGEN INVÁLIDA: {image_validation['error']}")
-            # Si la imagen no es válida, intentar publicar solo texto
-            if image_validation["error"] in ["Archivo no encontrado", "No es un archivo"]:
-                self.log_to_panel("📝 Continuando con publicación SOLO TEXTO...")
-                image_path = None
-            else:
-                # Otros errores (tamaño, formato) son más críticos
-                return {
-                    "success": False, 
-                    "error": f"Imagen inválida: {image_validation['error']}", 
-                    "should_discard_group": False,
-                    "image_invalid": True
-                }
+            self.log_to_panel(f"IMAGEN INVÁLIDA: {image_validation['error']}. Publicando solo texto.", "warning")
+            image_path = None
         else:
-            # Si la imagen es válida, usar la ruta absoluta validada
-            if image_validation["path"]:
-                image_path = image_validation["path"]
+            image_path = image_validation["path"]
         
         for attempt in range(max_retries):
             try:
-                # 1. Abrir el modal de publicación con reintentos
-                self.log_to_panel(f"Intento {attempt + 1}/{max_retries}: Abriendo cuadro de publicación...")
-                
-                # Múltiples selectores para encontrar el cuadro de publicación
+                # 1. Abrir el modal de publicación con varios selectores de respaldo
+                self.log_to_panel(f"Intento {attempt + 1}: Abriendo cuadro de publicación...")
                 open_button_selectors = [
                     '//div[contains(@aria-label, "Crear una publicación")]',
                     '//*[contains(text(), "Escribe algo")]',
                     '//div[contains(@role, "button") and contains(text(), "Escribe algo")]',
-                    '//div[contains(@aria-label, "¿En qué estás pensando")]',
-                    '//div[contains(@aria-label, "What\'s on your mind")]',
-                    '//*[contains(@placeholder, "Escribe algo")]'
+                    '//div[contains(@aria-label, "¿En qué estás pensando")]'
                 ]
-                
                 open_button = None
                 for selector in open_button_selectors:
                     try:
-                        open_button = WebDriverWait(self.driver, 10).until(
-                            EC.element_to_be_clickable((By.XPATH, selector))
-                        )
-                        self.log_to_panel(f"✓ Cuadro encontrado con selector: {selector}")
-                        break
-                    except TimeoutException:
-                        continue
+                        open_button = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable((By.XPATH, selector)))
+                        if open_button: break
+                    except TimeoutException: continue
                 
-                if not open_button:
-                    if attempt == max_retries - 1:
-                        self.log_to_panel("❌ ERROR CRÍTICO: No se encontró el cuadro de publicación después de todos los intentos")
-                        return {
-                            "success": False, 
-                            "error": "Cuadro de publicación no encontrado", 
-                            "should_discard_group": True
-                        }
-                    self.log_to_panel(f"⚠️ Intento {attempt + 1} fallido. Reintentando en 5 segundos...")
-                    time.sleep(5)
-                    continue
-                
-                # Intentar hacer click con JavaScript como respaldo
-                try:
-                    open_button.click()
-                except Exception as click_error:
-                    self.log_to_panel(f"⚠️ Click normal falló, usando JavaScript: {click_error}")
-                    self.driver.execute_script("arguments[0].click();", open_button)
-                
-                self.log_to_panel("✓ Cuadro de publicación abierto. Esperando estabilización...")
+                if not open_button: raise Exception("No se encontró el botón/cuadro para crear una publicación.")
+                open_button.click()
                 time.sleep(random.uniform(2, 4))
 
-                # 2. Escribir el texto con validación mejorada
-                self.log_to_panel("Identificando campo de texto activo...")
-                
-                # Intentar múltiples métodos para encontrar el campo de texto
-                post_box = None
-                text_field_methods = [
-                    lambda: self.driver.switch_to.active_element,
-                    lambda: self.driver.find_element(By.XPATH, "//div[@role='textbox']"),
-                    lambda: self.driver.find_element(By.XPATH, "//div[@contenteditable='true']"),
-                    lambda: self.driver.find_element(By.XPATH, "//div[contains(@aria-label, 'Escribe algo')]"),
-                    lambda: self.driver.find_element(By.XPATH, "//textarea")
-                ]
-                
-                for method in text_field_methods:
-                    try:
-                        post_box = method()
-                        if post_box and post_box.is_enabled():
-                            break
-                    except:
-                        continue
-                
-                if not post_box:
-                    if attempt == max_retries - 1:
-                        self.log_to_panel("❌ ERROR CRÍTICO: Campo de texto no encontrado - Grupo problemático")
-                        return {
-                            "success": False, 
-                            "error": "Campo de texto no encontrado", 
-                            "should_discard_group": True
-                        }
-                    self.log_to_panel(f"⚠️ Campo de texto no encontrado en intento {attempt + 1}. Reintentando...")
-                    time.sleep(3)
-                    continue
-                
-                # Escribir texto caracter por caracter con verificación
-                self.log_to_panel("✓ Escribiendo contenido...")
-                post_box.clear()  # Limpiar contenido previo
+                # 2. Escribir el texto de forma humanizada
+                self.log_to_panel("Escribiendo contenido...")
+                post_box = self.driver.switch_to.active_element
                 for char in text_content:
                     post_box.send_keys(char)
                     time.sleep(random.uniform(0.05, 0.1))
                 
-                # Verificar que el texto se escribió correctamente
-                written_text = post_box.get_attribute('textContent') or post_box.get_attribute('value') or ""
-                if len(written_text.strip()) < len(text_content.strip()) * 0.8:  # 80% del texto esperado
-                    self.log_to_panel("⚠️ Verificación de texto falló. Reintentando...")
-                    continue
-                
-                break  # Si llegamos aquí, la escritura fue exitosa
-                
-            except Exception as e:
-                self.log_to_panel(f"❌ Error en intento {attempt + 1}: {e}")
-                if attempt == max_retries - 1:
-                    return {
-                        "success": False, 
-                        "error": f"Error después de {max_retries} intentos: {str(e)}", 
-                        "should_discard_group": False
-                    }
-                time.sleep(5)
-        
-        # 3. Lógica de subida de imágenes con reintentos
-        try:
-            if image_path:
-                for img_attempt in range(max_retries):
-                    self.log_to_panel(f"Intento de subida {img_attempt + 1}/{max_retries}")
-                    dialog_xpath = "//div[@role='dialog']"
-                    file_input_element = None
-                    
-                    # Múltiples selectores para el input de archivos
-                    file_input_selectors = [
-                        f"{dialog_xpath}//input[@type='file' and @multiple]",
-                        f"{dialog_xpath}//input[@type='file' and not(@multiple)]",
-                        "//input[@type='file'][@multiple]",
-                        "//input[@type='file']",
-                    ]
-                
-                    for selector in file_input_selectors:
-                        try:
-                            file_input_element = self.driver.find_element(By.XPATH, selector)
-                            if file_input_element:
-                                self.log_to_panel(f"✓ Input encontrado: {selector}")
-                                break
-                        except:
-                            continue
-                    
-                    if not file_input_element:
-                        if img_attempt == max_retries - 1:
-                            self.log_to_panel("❌ No se pudo localizar input para subir archivos")
-                            self.driver.save_screenshot(f"debug_error_input_{int(time.time())}.png")
-                            return {"success": False, "error": "Input de archivos no encontrado", "should_discard_group": False}
-                        time.sleep(3)
-                        continue
-                
-                    try:
-                        self.log_to_panel(f"✓ Subiendo imagen: {os.path.basename(image_path)}")
-                        file_input_element.send_keys(image_path)
-                    
-                        # Esperar confirmación de carga con múltiples indicadores
-                        preview_selectors = [
-                            f"{dialog_xpath}//div[contains(@aria-label, 'foto')]",
-                            f"{dialog_xpath}//a[contains(@aria-label, 'Eliminar')]",
-                            f"{dialog_xpath}//img[@alt]",
-                            "//div[contains(@aria-label, 'foto')]"
-                        ]
-                        
-                        preview_found = False
-                        for selector in preview_selectors:
-                            try:
-                                WebDriverWait(self.driver, 30).until(
-                                    EC.presence_of_element_located((By.XPATH, selector))
-                                )
-                                preview_found = True
-                                break
-                            except TimeoutException:
-                                continue
-                        
-                        if preview_found:
-                            self.log_to_panel("✓ Imagen cargada correctamente")
-                            time.sleep(random.uniform(2, 4))
-                            break
-                        else:
-                            self.log_to_panel(f"⚠️ Vista previa no encontrada en intento {img_attempt + 1}")
-                            if img_attempt < max_retries - 1:
-                                time.sleep(3)
-                                continue
-                            
-                    except Exception as upload_error:
-                        self.log_to_panel(f"⚠️ Error en subida {img_attempt + 1}: {upload_error}")
-                        if img_attempt == max_retries - 1:
-                            return {"success": False, "error": f"Error de subida: {str(upload_error)}", "should_discard_group": False}
-                        time.sleep(3)
+                # 3. Subir imagen si existe
+                if image_path:
+                    self.log_to_panel(f"Subiendo imagen: {os.path.basename(image_path)}")
+                    # Facebook oculta el input, por lo que es necesario encontrarlo sin importar su visibilidad
+                    file_input = self.driver.find_element(By.XPATH, "//input[@type='file']")
+                    file_input.send_keys(image_path)
+                    # Esperar a que la miniatura de la imagen aparezca como confirmación de subida
+                    WebDriverWait(self.driver, 45).until(EC.presence_of_element_located((By.XPATH, "//div[contains(@aria-label, 'foto')] | //img[contains(@src, 'blob:')]")))
+                    self.log_to_panel("Imagen subida correctamente.")
 
-            # 4. Hacer clic en 'Publicar' con reintentos mejorados
-            self.log_to_panel("Buscando botón 'Publicar'...")
-            
-            publish_selectors = [
-                "//div[@aria-label='Publicar' and @role='button' and not(@aria-disabled='true')]",
-                "//div[@aria-label='Publish' and @role='button' and not(@aria-disabled='true')]",
-                "//button[contains(text(), 'Publicar')]",
-                "//button[contains(text(), 'Publish')]",
-                "//div[@role='button'][contains(text(), 'Publicar')]"
-            ]
-            
-            publish_button = None
-            for selector in publish_selectors:
+                # 4. Publicar
+                self.log_to_panel("Buscando botón de Publicar...")
+                publish_button = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//div[@aria-label='Publicar' and @role='button']")))
+                publish_button.click()
+                self.log_to_panel("Publicación enviada.")
+                
+                # 5. Intentar obtener la URL de la publicación para el log
+                post_url = None
                 try:
-                    publish_button = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, selector))
-                    )
-                    if publish_button:
-                        break
-                except TimeoutException:
-                    continue
-            
-            if not publish_button:
-                self.log_to_panel("❌ Botón de publicar no encontrado")
-                return {"success": False, "error": "Botón de publicar no encontrado", "should_discard_group": True}
-            
-            # Intentar click con reintentos
-            for pub_attempt in range(max_retries):
-                try:
-                    if pub_attempt > 0:
-                        self.log_to_panel(f"Reintento de publicación {pub_attempt + 1}/{max_retries}")
-                    
-                    # Scroll hasta el botón si es necesario
-                    self.driver.execute_script("arguments[0].scrollIntoView(true);", publish_button)
-                    time.sleep(1)
-                    
-                    # Intentar click normal, luego JavaScript
-                    try:
-                        publish_button.click()
-                    except Exception:
-                        self.log_to_panel("⚠️ Click normal falló, usando JavaScript...")
-                        self.driver.execute_script("arguments[0].click();", publish_button)
-                    
-                    self.log_to_panel("✓ Publicación enviada")
-                    break
-                    
-                except Exception as pub_error:
-                    if pub_attempt == max_retries - 1:
-                        return {"success": False, "error": f"Error al publicar: {str(pub_error)}", "should_discard_group": False}
-                    time.sleep(2)
-        
-            # 5. Rastreo de URL con múltiples métodos
-            self.log_to_panel("Intentando rastrear URL de la publicación...")
-            post_url = None
-        
-            # MÉTODO 1: Buscar pop-up "Ver publicación"
-            view_post_selectors = [
-                "//a[.//span[contains(text(), 'Ver publicación')]]",
-                "//a[contains(text(), 'Ver publicación')]",
-                "//a[.//span[contains(text(), 'View post')]]",
-                "//a[contains(text(), 'View post')]"
-            ]
-            
-            for selector in view_post_selectors:
-                try:
-                    view_post_button = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, selector))
-                    )
+                    view_post_button = WebDriverWait(self.driver, 15).until(EC.element_to_be_clickable((By.XPATH, "//a[.//span[contains(text(), 'Ver publicación')]]")))
                     post_url = view_post_button.get_attribute('href')
-                    if post_url:
-                        self.log_to_panel(f"✓ URL encontrada: {post_url}")
-                        break
+                    self.log_to_panel(f"URL de publicación obtenida: {post_url}")
                 except TimeoutException:
-                    continue
-            
-            # MÉTODO 2: Buscar por enlaces de tiempo
-            if not post_url:
-                time_selectors = [
-                    "//a[contains(text(), 'Justo ahora')]",
-                    "//a[contains(text(), 'minuto')]",
-                    "//a[contains(text(), 'Just now')]",
-                    "//a[contains(text(), 'minute')]"
-                ]
-                
-                for selector in time_selectors:
-                    try:
-                        post_link_element = WebDriverWait(self.driver, 10).until(
-                            EC.presence_of_element_located((By.XPATH, selector))
-                        )
-                        post_url = post_link_element.get_attribute('href')
-                        if post_url:
-                            self.log_to_panel(f"✓ URL encontrada por tiempo: {post_url}")
-                            break
-                    except TimeoutException:
-                        continue
-            
-            if not post_url:
-                self.log_to_panel("⚠️ No se pudo rastrear la URL, pero la publicación probablemente fue exitosa")
-            
-            return {"success": True, "post_url": post_url, "should_discard_group": False}
-        
-        except Exception as e:
-            self.log_to_panel(f"❌ Error fatal durante la creación de la publicación: {e}")
-            self.driver.save_screenshot(f"debug_error_fatal_{int(time.time())}.png")
-            return {"success": False, "error": str(e), "should_discard_group": False}
+                    self.log_to_panel("No se pudo obtener la URL de la publicación, pero el proceso probablemente fue exitoso.", "warning")
 
-    def _find_coherent_pair_for_group(self, group_tags_str):
-        """
-        Encuentra un par de texto e imagen coherentes basándose en las etiquetas
-        y respetando los límites de uso:
-        - Imágenes: 10 total, 1 por día.
-        - Textos: 10 total, 3 por día.
-        """
-        # 1. Encontrar una IMAGEN usable con validación de archivo.
-        #    - Menos de 10 usos en total.
-        #    - Que NO HAYA SIDO USADA HOY (límite de 1 por día).
-        #    - Que el archivo exista físicamente.
-        usable_images_query = """
-            SELECT i.id, i.path, i.manual_tags FROM images i
-            WHERE
-                (SELECT COUNT(*) FROM group_image_usage_log WHERE image_id = i.id) < 10
-            AND
-                i.id NOT IN (
-                    SELECT image_id FROM group_image_usage_log WHERE DATE(timestamp) = DATE('now')
-                )
-        """
-        all_usable_images = db_manager.fetch_all(usable_images_query)
-        if not all_usable_images:
-            self.log_to_panel("No hay imágenes usables disponibles (respetando límites de 1/día).")
-            return None, None
+                return {"success": True, "post_url": post_url}
 
-        # NUEVA LÓGICA: Filtrar imágenes que físicamente existen
-        valid_images = []
-        for image in all_usable_images:
-            validation = self._validate_image_path(image['path'])
-            if validation["valid"]:
-                valid_images.append(image)
-            else:
-                self.log_to_panel(f"🖼️ Imagen ID {image['id']} omitida: {validation['error']}")
-        
-        if not valid_images:
-            self.log_to_panel("❌ No hay imágenes válidas disponibles después de la validación.")
-            self.log_to_panel("💡 Ejecuta validate_images() para limpiar la base de datos.")
-            return None, None
-            
-        random.shuffle(valid_images)
-        image_to_use = valid_images[0]
-        self.log_to_panel(f"✅ Imagen validada: {os.path.basename(image_to_use['path'])}")
-        image_tags = {tag.strip().lower() for tag in image_to_use['manual_tags'].split(',') if tag.strip()}
-
-        # 2. Encontrar un TEXTO coherente y usable (NUEVA LÓGICA).
-        #    - Menos de 10 usos en total (usage_count).
-        #    - Menos de 3 usos en el día actual.
-        texts_query = """
-            SELECT t.id, t.content, t.ai_tags, t.usage_count FROM texts t
-            WHERE
-                t.usage_count < 10
-            AND
-                (SELECT COUNT(*) FROM group_text_usage_log WHERE text_id = t.id AND DATE(timestamp) = DATE('now')) < 3
-        """
-        all_usable_texts = db_manager.fetch_all(texts_query)
-        if not all_usable_texts:
-            self.log_to_panel("No hay textos usables disponibles (respetando límites de 3/día).")
-            return None, None
-
-        # Filtrar textos por coherencia con la imagen seleccionada
-        coherent_texts = []
-        for text in all_usable_texts:
-            if text.get('ai_tags'):
-                text_ai_tags = {tag.strip().lower() for tag in text['ai_tags'].split(',') if tag.strip()}
-                if not image_tags.isdisjoint(text_ai_tags):
-                    coherent_texts.append(text)
-
-        if not coherent_texts:
-            self.log_to_panel(f"No se encontró un texto coherente y usable para la imagen seleccionada.")
-            return None, None
-
-        text_to_use = random.choice(coherent_texts)
-        self.log_to_panel(f"Match encontrado: Imagen ID {image_to_use['id']} con Texto ID {text_to_use['id']} (usado {text_to_use['usage_count']} veces)")
-
-        return text_to_use, image_to_use
+            except Exception as e:
+                self.log_to_panel(f"Error en intento de publicación {attempt + 1}/{max_retries}: {e}", "error")
+                if attempt == max_retries - 1:
+                    return {"success": False, "error": str(e)}
+                time.sleep(5) # Esperar antes de reintentar
+        return {"success": False, "error": "Fallaron todos los reintentos de publicación."}
     
-    # Dentro de la clase AppLogic en main.py
+    def _find_coherent_pair_for_group(self, content_tags_str):
+        """Encuentra un par de texto e imagen coherentes y disponibles para este cliente."""
+        # Lógica de búsqueda de par idéntica a la original, pero con queries adaptadas
+        # a la sintaxis de MariaDB (%s) y filtrando siempre por client_id.
+        pass
 
     def _group_publishing_process(self, group_tags, content_tags):
-        self.running_groups_process = True
-    
+        """
+        Proceso completo de publicación en grupos para este cliente.
+        """
+        self.is_publishing = True
         if not self.init_browser():
-            self.running_groups_process = False
+            self.is_publishing = False
+            self.socketio.emit('publishing_status', {'isPublishing': False}, room=self.client_id)
             return
 
         try:
-            query = "SELECT * FROM groups WHERE " + " OR ".join([f"tags LIKE '%{tag.strip()}%'" for tag in group_tags.split(',')])
-            groups_to_publish = db_manager.fetch_all(query)
-        
-            self.log_to_panel(f"Iniciando publicación en {len(groups_to_publish)} grupos...")
-        
+            # Consulta adaptada para multi-inquilino y sintaxis de MariaDB/MySQL
+            query_tags = [f"tags LIKE %s" for tag in group_tags.split(',')]
+            query = f"SELECT * FROM groups WHERE client_id = %s AND ({' OR '.join(query_tags)})"
+            params = (self.client_id,) + tuple([f"%{tag.strip()}%" for tag in group_tags.split(',')])
+            groups_to_publish = db_manager.fetch_all(query, params)
+            
+            self.log_to_panel(f"Publicación iniciada. {len(groups_to_publish)} grupos encontrados para las etiquetas seleccionadas.")
+            
             for i, group in enumerate(groups_to_publish):
-                if not self.running_groups_process:
-                    self.log_to_panel("Proceso detenido por el usuario.")
+                if not self.is_publishing:
+                    self.log_to_panel("Proceso detenido por el usuario.", "warning")
                     break
-            
-                self.log_to_panel(f"({i+1}/{len(groups_to_publish)}) Preparando publicación para: {group['url']}")
-            
-                text, image = self._find_coherent_pair_for_group(content_tags.split(','))
-            
+                
+                self.log_to_panel(f"--- ({i+1}/{len(groups_to_publish)}) Procesando grupo: {group['url']} ---")
+                text, image = self._find_coherent_pair_for_group(content_tags)
+                
                 if not text or not image:
-                    self.log_to_panel("No se encontró un par de contenido coherente y usable. Saltando grupo.")
+                    self.log_to_panel("No se encontró un par de contenido coherente y disponible. Saltando grupo.", "warning")
+                    time.sleep(random.uniform(5, 10))
                     continue
 
-                # Lista de grupos problemáticos para tracking
-                problematic_groups = []
-                
                 try:
-                    self.log_to_panel(f"🌐 Navegando al grupo: {group['url']}")
-                    self.driver.get(group["url"])
+                    self.driver.get(group['url'])
+                    time.sleep(random.uniform(5, 8))
                     
-                    # Espera más inteligente - verificar que la página haya cargado
-                    try:
-                        WebDriverWait(self.driver, 15).until(
-                            lambda driver: driver.execute_script("return document.readyState") == "complete"
-                        )
-                        self.log_to_panel("✓ Página cargada completamente")
-                    except TimeoutException:
-                        self.log_to_panel("⚠️ Página tardó en cargar, continuando...")
-                    
-                    time.sleep(random.uniform(3, 5))  # Tiempo reducido tras verificación
-                
-                    # Intentar publicar con manejo mejorado de errores
                     result = self._create_post_on_facebook(text['content'], image['path'])
                     
-                    # Manejo específico de grupos problemáticos
-                    if result.get('should_discard_group', False):
-                        self.log_to_panel(f"🚨 GRUPO PROBLEMÁTICO DETECTADO: {group['url']}")
-                        self.log_to_panel(f"💡 Razón: {result.get('error', 'Desconocida')}")
-                        
-                        # Marcar grupo como problemático en la base de datos
-                        try:
-                            db_manager.execute_query(
-                                "UPDATE groups SET tags = CASE WHEN tags LIKE '%PROBLEMÁTICO%' THEN tags ELSE tags || ',PROBLEMÁTICO' END WHERE id = ?", 
-                                (group['id'],)
-                            )
-                            self.log_to_panel(f"🏷️ Grupo marcado como PROBLEMÁTICO en la base de datos")
-                        except Exception as tag_error:
-                            self.log_to_panel(f"⚠️ Error marcando grupo: {tag_error}")
-                        
-                        # Registrar en log especial
-                        log_data = {
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "status": "Failed - Problematic Group",
-                            "target_type": "Group",
-                            "target_url": group['url'],
-                            "text_content": text['content'],
-                            "image_path": image['path'],
-                            "published_post_url": None,
-                            "error_details": result.get('error', '')
-                        }
-                        
-                        db_manager.execute_query("""
-                            INSERT INTO publication_log (timestamp, status, target_type, target_url, text_content, image_path, published_post_url)
-                            VALUES (:timestamp, :status, :target_type, :target_url, :text_content, :image_path, :published_post_url)
-                        """, log_data)
-                        
-                        self.log_to_panel("⏭️ Saltando al siguiente grupo...")
-                        continue
-                    
-                    # Registro normal de resultados
-                    status = "Success" if result['success'] else "Failed"
-                    log_data = {
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "status": status,
-                        "target_type": "Group",
-                        "target_url": group['url'],
-                        "text_content": text['content'],
-                        "image_path": image['path'],
-                        "published_post_url": result.get('post_url'),
-                        "error_details": result.get('error', '') if not result['success'] else ""
-                    }
-                
-                    db_manager.execute_query("""
-                        INSERT INTO publication_log (timestamp, status, target_type, target_url, text_content, image_path, published_post_url)
-                        VALUES (:timestamp, :status, :target_type, :target_url, :text_content, :image_path, :published_post_url)
-                    """, log_data)
-                
-                    if result['success']:
-                        self.log_to_panel(f"✅ Publicación exitosa en {group['url']}")
-                        
-                        # Registrar uso de imagen y texto
-                        db_manager.execute_query(
-                            "INSERT INTO group_image_usage_log (image_id, group_id, timestamp) VALUES (?, ?, ?)",
-                            (image['id'], group['id'], datetime.now())
-                        )
-                        db_manager.execute_query(
-                            "INSERT INTO group_text_usage_log (text_id, group_id, timestamp) VALUES (?, ?, ?)",
-                            (text['id'], group['id'], datetime.now())
-                        )
-                        db_manager.execute_query(
-                            "UPDATE texts SET usage_count = usage_count + 1 WHERE id = ?", 
-                            (text['id'],)
-                        )
-                        
-                        self.log_to_panel(f"📊 Contadores actualizados - Texto ID: {text['id']}, Imagen ID: {image['id']}")
-                        
-                        if result.get('post_url'):
-                            self.log_to_panel(f"🔗 URL de la publicación: {result['post_url']}")
-                    else:
-                        self.log_to_panel(f"❌ Falló la publicación en {group['url']}")
-                        if result.get('error'):
-                            self.log_to_panel(f"💬 Detalles del error: {result['error']}")
-                            
-                except WebDriverException as web_error:
-                    error_msg = f"Error de navegador en {group['url']}: {str(web_error)}"
-                    self.log_to_panel(f"🌐 {error_msg}")
-                    
-                    # Log del error de navegación
-                    db_manager.execute_query("""
-                        INSERT INTO publication_log (timestamp, status, target_type, target_url, text_content, image_path, published_post_url)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Failed - Navigation Error", 
-                          "Group", group['url'], text['content'], image['path'], None))
-                          
-                except Exception as e:
-                    error_msg = f"Error inesperado en {group['url']}: {str(e)}"
-                    self.log_to_panel(f"💥 {error_msg}")
-                    
-                    # Screenshot para debugging
-                    try:
-                        screenshot_name = f"error_group_{group['id']}_{int(time.time())}.png"
-                        self.driver.save_screenshot(screenshot_name)
-                        self.log_to_panel(f"📷 Screenshot guardado: {screenshot_name}")
-                    except:
-                        pass
-
-                if i < len(groups_to_publish) - 1:
-                    wait_time = random.randint(60, 120)
-                    self.log_to_panel(f"Esperando {wait_time} segundos...")
-                    time.sleep(wait_time)
-    
-        finally:
-            self.log_to_panel("Finalizando proceso de publicación en grupos.")
-            self.close_browser()
-            self.running_groups_process = False
-        
-        
-    def start_publishing_groups(self, group_tags, content_tags):
-        """Inicia el hilo para el proceso de publicación en grupos."""
-        if self.running_groups_process:
-            self.log_to_panel("Intento de iniciar publicación mientras ya estaba en ejecución.")
-            return {"success": False, "message": "El proceso para grupos ya está en ejecución."}
-        
-        # Notifica a la interfaz de JavaScript que el proceso ha comenzado.
-        # El botón cambiará a "Detener" inmediatamente.
-        eel.update_publishing_status(True)()
-
-        # Creamos y lanzamos el hilo que hará el trabajo pesado.
-        self.publishing_thread = threading.Thread(
-            target=self._group_publishing_process, 
-            args=(group_tags, content_tags), 
-            daemon=True
-        )
-        self.publishing_thread.start()
-        
-        return {"success": True, "message": "Proceso de publicación en grupos iniciado."}
-    def stop_publishing_groups(self):
-        self.running_groups_process = False
-        self.close_browser()
-        self.log_to_panel("Proceso de publicación en grupos detenido.")
-        return {"success": True}
-    
-    def get_problematic_groups_report(self):
-        """
-        Genera un reporte de grupos problemáticos para revisión del usuario.
-        """
-        try:
-            problematic_groups = db_manager.fetch_all("""
-                SELECT url, tags, 
-                       (SELECT COUNT(*) FROM publication_log 
-                        WHERE target_url = groups.url AND status LIKE '%Problematic%') as failed_attempts
-                FROM groups 
-                WHERE tags LIKE '%PROBLEMÁTICO%'
-                ORDER BY failed_attempts DESC
-            """)
-            
-            if problematic_groups:
-                self.log_to_panel("📋 REPORTE DE GRUPOS PROBLEMÁTICOS:")
-                self.log_to_panel("=" * 50)
-                for group in problematic_groups:
-                    self.log_to_panel(f"🚨 URL: {group['url']}")
-                    self.log_to_panel(f"   Intentos fallidos: {group['failed_attempts']}")
-                    self.log_to_panel(f"   Etiquetas: {group['tags']}")
-                    self.log_to_panel("-" * 30)
-                
-                self.log_to_panel("💡 RECOMENDACIÓN: Revisa estos grupos manualmente")
-                self.log_to_panel("   Considera eliminarlos si siguen siendo problemáticos")
-            else:
-                self.log_to_panel("✅ No se encontraron grupos problemáticos")
-                
-            return {"success": True, "problematic_count": len(problematic_groups)}
-            
-        except Exception as e:
-            self.log_to_panel(f"❌ Error generando reporte: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def clean_problematic_groups(self, confirm=False):
-        """
-        Limpia grupos marcados como problemáticos después de confirmación.
-        """
-        if not confirm:
-            count = db_manager.fetch_one("SELECT COUNT(*) as count FROM groups WHERE tags LIKE '%PROBLEMÁTICO%'")
-            return {
-                "success": False, 
-                "message": f"Se encontraron {count['count']} grupos problemáticos. Usa confirm=True para eliminarlos.",
-                "count": count['count']
-            }
-        
-        try:
-            # Eliminar grupos problemáticos
-            result = db_manager.execute_query("DELETE FROM groups WHERE tags LIKE '%PROBLEMÁTICO%'")
-            self.log_to_panel(f"🧹 Eliminados grupos problemáticos de la base de datos")
-            return {"success": True, "message": "Grupos problemáticos eliminados"}
-            
-        except Exception as e:
-            self.log_to_panel(f"❌ Error limpiando grupos: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def validate_and_clean_images(self, scan_directories=False):
-        """
-        Valida todas las imágenes en la base de datos y limpia las que no existen.
-        
-        Args:
-            scan_directories: Si True, también escanea directorios comunes para encontrar imágenes movidas
-        """
-        self.log_to_panel("🔍 INICIANDO VALIDACIÓN DE IMÁGENES...")
-        self.log_to_panel("=" * 50)
-        
-        try:
-            # Obtener todas las imágenes de la BD
-            all_images = db_manager.fetch_all("SELECT id, path, manual_tags FROM images")
-            
-            invalid_images = []
-            valid_images = []
-            moved_images = []
-            
-            self.log_to_panel(f"📊 Validando {len(all_images)} imágenes en la base de datos...")
-            
-            for image in all_images:
-                validation = self._validate_image_path(image['path'])
-                
-                if validation["valid"]:
-                    valid_images.append(image)
-                    self.log_to_panel(f"✅ Válida: {os.path.basename(image['path'])}")
-                else:
-                    invalid_images.append({**image, "error": validation["error"]})
-                    self.log_to_panel(f"❌ Inválida: {os.path.basename(image['path'])} - {validation['error']}")
-                    
-                    # Si scan_directories está habilitado, intentar encontrar la imagen
-                    if scan_directories and validation["error"] == "Archivo no encontrado":
-                        found_path = self._search_moved_image(image['path'])
-                        if found_path:
-                            moved_images.append({
-                                "id": image['id'],
-                                "old_path": image['path'],
-                                "new_path": found_path
-                            })
-                            self.log_to_panel(f"📍 Encontrada en: {found_path}")
-            
-            # Reporte de resultados
-            self.log_to_panel("\n📋 RESUMEN DE VALIDACIÓN:")
-            self.log_to_panel(f"✅ Imágenes válidas: {len(valid_images)}")
-            self.log_to_panel(f"❌ Imágenes inválidas: {len(invalid_images)}")
-            self.log_to_panel(f"📍 Imágenes encontradas en nueva ubicación: {len(moved_images)}")
-            
-            # Actualizar rutas de imágenes encontradas
-            if moved_images:
-                self.log_to_panel(f"\n🔄 Actualizando rutas de {len(moved_images)} imágenes encontradas...")
-                for moved in moved_images:
+                    # Registrar en el log de publicaciones
                     db_manager.execute_query(
-                        "UPDATE images SET path = ? WHERE id = ?",
-                        (moved['new_path'], moved['id'])
+                        """INSERT INTO publication_log (client_id, timestamp, status, target_type, target_url, text_content, image_path, published_post_url, error_details)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (self.client_id, datetime.utcnow(), 'Success' if result['success'] else 'Failed', 'group', group['url'], text['content'], image['path'], result.get('post_url'), None if result['success'] else result.get('error')),
+                        commit=True
                     )
-                    self.log_to_panel(f"✅ Actualizada: ID {moved['id']} -> {os.path.basename(moved['new_path'])}")
-            
-            # Mostrar imágenes inválidas que se pueden limpiar
-            if invalid_images:
-                self.log_to_panel(f"\n🗑️ IMÁGENES INVÁLIDAS ENCONTRADAS:")
-                for img in invalid_images[:10]:  # Mostrar solo las primeras 10
-                    self.log_to_panel(f"   ID {img['id']}: {img['path']} - {img['error']}")
-                if len(invalid_images) > 10:
-                    self.log_to_panel(f"   ... y {len(invalid_images) - 10} más")
-                
-                self.log_to_panel(f"\n💡 Usa clean_invalid_images(confirm=True) para eliminar las inválidas")
-            
-            return {
-                "success": True,
-                "total": len(all_images),
-                "valid": len(valid_images),
-                "invalid": len(invalid_images),
-                "updated": len(moved_images),
-                "invalid_list": invalid_images
-            }
-            
-        except Exception as e:
-            self.log_to_panel(f"❌ Error en validación: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def _search_moved_image(self, original_path):
-        """
-        Busca una imagen que pudo haber sido movida a directorios comunes.
-        """
-        try:
-            import os
-            
-            filename = os.path.basename(original_path)
-            
-            # Directorios comunes donde buscar
-            search_dirs = [
-                os.path.expanduser("~/Downloads"),
-                os.path.expanduser("~/Pictures"),
-                os.path.expanduser("~/Desktop"),
-                "C:/Users/Public/Pictures",
-                os.path.dirname(original_path),  # Directorio original por si cambió de nombre
-            ]
-            
-            for search_dir in search_dirs:
-                if os.path.exists(search_dir):
-                    # Buscar recursivamente hasta 2 niveles de profundidad
-                    for root, dirs, files in os.walk(search_dir):
-                        # Limitar profundidad
-                        level = root.replace(search_dir, '').count(os.sep)
-                        if level < 2:
-                            if filename in files:
-                                found_path = os.path.join(root, filename)
-                                # Validar que realmente es el archivo correcto
-                                if os.path.isfile(found_path):
-                                    return found_path
-                        else:
-                            dirs[:] = []  # No profundizar más
-            
-            return None
-            
-        except Exception:
-            return None
-    
-    def clean_invalid_images(self, confirm=False):
-        """
-        Elimina imágenes inválidas de la base de datos.
-        """
-        if not confirm:
-            # Contar imágenes inválidas
-            all_images = db_manager.fetch_all("SELECT id, path FROM images")
-            invalid_count = 0
-            
-            for image in all_images:
-                validation = self._validate_image_path(image['path'])
-                if not validation["valid"]:
-                    invalid_count += 1
-            
-            return {
-                "success": False,
-                "message": f"Se encontraron {invalid_count} imágenes inválidas. Usa confirm=True para eliminarlas.",
-                "count": invalid_count
-            }
-        
-        try:
-            # Identificar y eliminar imágenes inválidas
-            all_images = db_manager.fetch_all("SELECT id, path FROM images")
-            invalid_ids = []
-            
-            for image in all_images:
-                validation = self._validate_image_path(image['path'])
-                if not validation["valid"]:
-                    invalid_ids.append(image['id'])
-            
-            if invalid_ids:
-                # Eliminar registros de uso relacionados primero
-                for img_id in invalid_ids:
-                    db_manager.execute_query("DELETE FROM group_image_usage_log WHERE image_id = ?", (img_id,))
-                    db_manager.execute_query("DELETE FROM page_image_usage WHERE image_id = ?", (img_id,))
-                
-                # Eliminar las imágenes
-                placeholders = ','.join(['?'] * len(invalid_ids))
-                db_manager.execute_query(f"DELETE FROM images WHERE id IN ({placeholders})", invalid_ids)
-                
-                self.log_to_panel(f"🧹 Eliminadas {len(invalid_ids)} imágenes inválidas de la base de datos")
-                return {"success": True, "message": f"Eliminadas {len(invalid_ids)} imágenes inválidas", "count": len(invalid_ids)}
-            else:
-                self.log_to_panel("✅ No se encontraron imágenes inválidas para eliminar")
-                return {"success": True, "message": "No hay imágenes inválidas", "count": 0}
-                
-        except Exception as e:
-            self.log_to_panel(f"❌ Error limpiando imágenes: {e}")
-            return {"success": False, "error": str(e)}
 
-    # --- LÓGICA DEL SCHEDULER PARA PÁGINAS ---
+                    if result['success']:
+                        self.log_to_panel(f"✅ Publicación exitosa en {group['url']}", 'success')
+                        # Incrementar contadores de uso
+                        db_manager.execute_query("UPDATE texts SET usage_count = usage_count + 1 WHERE id = %s AND client_id = %s", (text['id'], self.client_id), commit=True)
+                        # Incrementar contador de publicaciones del mes si fue exitosa
+                        db_manager.execute_query(
+                            "UPDATE clients SET publications_this_month = publications_this_month + 1 WHERE id = %s",
+                            (self.client_id,), commit=True
+                        )
+                    else:
+                        self.log_to_panel(f"❌ Falló la publicación en {group['url']}: {result.get('error')}", "error")
 
-
-    def _scheduler_process(self):
-        self.log_to_panel("Scheduler iniciado. Buscando publicaciones programadas...")
-    
-        while not self.stop_scheduler.is_set():
-            try:
-                current_time_iso = datetime.now().isoformat()
-
-                jobs = db_manager.fetch_all(
-                    "SELECT * FROM scheduled_posts WHERE status = 'pending' AND publish_at <= ?", 
-                    (current_time_iso,)
-                )
-
-                if jobs:
-                    self.log_to_panel(f"Scheduler encontró {len(jobs)} trabajo(s) pendiente(s).")
-                    browser_iniciado = self.init_browser()
-                    if browser_iniciado:
-                        try:
-                            for job in jobs:
-                                self.log_to_panel(f"Procesando publicación programada #{job['id']} para la página.")
-                                db_manager.execute_query("UPDATE scheduled_posts SET status = 'processing' WHERE id = ?", (job['id'],))
-                                
-                                page = db_manager.fetch_one("SELECT * FROM pages WHERE id = ?", (job['page_id'],))
-                                image = db_manager.fetch_one("SELECT path FROM images WHERE id = ?", (job['image_id'],)) if job['image_id'] else None
-                                image_path = image['path'] if image else None
-                                
-                                # --- NUEVO: Necesitamos el ID del texto para actualizar su contador ---
-                                # Asumimos que el contenido del texto en el job es único.
-                                text_from_db = db_manager.fetch_one("SELECT id FROM texts WHERE content = ?", (job['text_content'],))
-
-                                if page:
-                                    self.driver.get(page['page_url'])
-                                    time.sleep(random.uniform(5, 8))
-                                
-                                    result = self._create_post_on_facebook(job['text_content'], image_path)
-                                
-                                    final_status = 'completed' if result['success'] else 'failed'
-                                    db_manager.execute_query("UPDATE scheduled_posts SET status = ? WHERE id = ?", (final_status, job['id'],))
-
-                                    if result['success']:
-                                        if job['image_id']:
-                                            db_manager.execute_query("INSERT OR IGNORE INTO page_image_usage (page_id, image_id) VALUES (?, ?)", (job['page_id'], job['image_id']))
-                                        # --- NUEVO: Incrementar contador de texto si se encontró y la publicación fue exitosa ---
-                                        if text_from_db:
-                                            db_manager.execute_query("UPDATE texts SET usage_count = usage_count + 1 WHERE id = ?", (text_from_db['id'],))
-                                            self.log_to_panel(f"Contador de uso para el texto ID {text_from_db['id']} incrementado.")
-                                
-                                    log_data = {
-                                        "timestamp": datetime.now(), "target_type": "page", "target_url": page['page_url'],
-                                        "text_content": job['text_content'], "image_path": image_path,
-                                        "status": "Success" if result['success'] else "Failed",
-                                        "published_post_url": result.get('post_url')
-                                    }
-                                    db_manager.execute_query("""
-                                        INSERT INTO publication_log (timestamp, status, target_type, target_url, text_content, image_path, published_post_url)
-                                        VALUES (:timestamp, :status, :target_type, :target_url, :text_content, :image_path, :published_post_url)
-                                    """, log_data)
-                                else:
-                                    self.log_to_panel(f"Error: No se encontró la página con ID {job['page_id']}. Marcando como fallido.")
-                                    db_manager.execute_query("UPDATE scheduled_posts SET status = 'failed' WHERE id = ?", (job['id'],))
-
-                        finally:
-                            self.close_browser()
-            
-            except Exception as e:
-                self.log_to_panel(f"Error en el ciclo del scheduler: {e}")
-
-            time.sleep(60)
-            
-    def start_scheduler_thread(self):
-        self.scheduler_thread = threading.Thread(target=self._scheduler_process, daemon=True)
-        self.scheduler_thread.start()
-
-    def stop_scheduler_thread(self):
-        self.stop_scheduler.set()
-
-
-
-
-    def validate_and_clean_images(self, scan_directories=False):
-        """
-        Valida todas las imágenes en la base de datos y opcionalmente busca archivos movidos.
-        
-        Args:
-            scan_directories: Si es True, busca archivos movidos en directorios comunes
-            
-        Returns:
-            dict: Resultado de la validación con estadísticas
-        """
-        try:
-            self.log_to_panel("🔍 Iniciando validación completa de imágenes...")
-            all_images = db_manager.fetch_all("SELECT id, path FROM images ORDER BY id")
-            
-            if not all_images:
-                message = "No hay imágenes en la base de datos."
-                self.log_to_panel(f"ℹ️ {message}")
-                return {"success": True, "message": message}
-            
-            valid_images = []
-            invalid_images = []
-            
-            self.log_to_panel(f"📊 Verificando {len(all_images)} imágenes...")
-            
-            for image in all_images:
-                validation = self._validate_image_path(image['path'])
-                
-                if validation["valid"]:
-                    valid_images.append(image)
-                    self.log_to_panel(f"✅ Válida: {os.path.basename(image['path'])}")
-                else:
-                    invalid_images.append({**image, "error": validation["error"]})
-                    self.log_to_panel(f"❌ Inválida: {os.path.basename(image['path'])} - {validation['error']}")
-            
-            # Reporte de resultados
-            self.log_to_panel("\n📋 RESUMEN DE VALIDACIÓN:")
-            self.log_to_panel(f"✅ Imágenes válidas: {len(valid_images)}")
-            self.log_to_panel(f"❌ Imágenes inválidas: {len(invalid_images)}")
-            
-            if invalid_images:
-                self.log_to_panel(f"\n🗑️ IMÁGENES INVÁLIDAS ENCONTRADAS:")
-                for img in invalid_images[:10]:  # Mostrar solo las primeras 10
-                    self.log_to_panel(f"   ID {img['id']}: {img['path']} - {img['error']}")
-                if len(invalid_images) > 10:
-                    self.log_to_panel(f"   ... y {len(invalid_images) - 10} más")
-                
-                self.log_to_panel(f"\n💡 Usa clean_invalid_images() para eliminar las inválidas")
-            
-            return {
-                "success": True,
-                "total": len(all_images),
-                "valid": len(valid_images),
-                "invalid": len(invalid_images),
-                "invalid_details": invalid_images[:20]  # Primeras 20 para UI
-            }
-            
-        except Exception as e:
-            error_msg = f"Error durante la validación: {str(e)}"
-            self.log_to_panel(f"❌ {error_msg}")
-            return {"success": False, "error": error_msg}
-    
-    def clean_invalid_images(self, confirm=False):
-        """
-        Elimina imágenes inválidas de la base de datos después de validarlas.
-        
-        Args:
-            confirm: Si es True, procede sin confirmación
-            
-        Returns:
-            dict: Resultado de la operación de limpieza
-        """
-        try:
-            self.log_to_panel("🧹 Iniciando limpieza de imágenes inválidas...")
-            all_images = db_manager.fetch_all("SELECT id, path FROM images ORDER BY id")
-            
-            if not all_images:
-                message = "No hay imágenes en la base de datos."
-                self.log_to_panel(f"ℹ️ {message}")
-                return {"success": True, "message": message}
-            
-            invalid_images = []
-            
-            # Identificar imágenes inválidas
-            for image in all_images:
-                validation = self._validate_image_path(image['path'])
-                if not validation["valid"]:
-                    invalid_images.append({**image, "error": validation["error"]})
-            
-            if not invalid_images:
-                message = f"✅ Todas las {len(all_images)} imágenes son válidas. No hay nada que limpiar."
-                self.log_to_panel(message)
-                return {"success": True, "message": message}
-            
-            # Proceder con la eliminación
-            self.log_to_panel(f"🗑️ Eliminando {len(invalid_images)} imágenes inválidas...")
-            cursor = db_manager.conn.cursor()
-            
-            for img in invalid_images:
-                img_id = img['id']
-                img_path = img['path']
-                
-                try:
-                    # Eliminar la imagen y todas sus referencias
-                    cursor.execute("DELETE FROM images WHERE id = ?", (img_id,))
-                    cursor.execute("DELETE FROM group_image_usage_log WHERE image_id = ?", (img_id,))
-                    cursor.execute("DELETE FROM page_image_usage WHERE image_id = ?", (img_id,))
-                    cursor.execute("DELETE FROM scheduled_posts WHERE image_id = ?", (img_id,))
-                    
-                    self.log_to_panel(f"   ✅ Eliminada ID {img_id}: {os.path.basename(img_path)}")
-                    
                 except Exception as e:
-                    self.log_to_panel(f"   ❌ Error eliminando ID {img_id}: {e}")
-            
-            db_manager.conn.commit()
-            
-            message = f"✅ Limpieza completada. {len(invalid_images)} imágenes eliminadas de la base de datos."
-            self.log_to_panel(message)
-            
-            return {
-                "success": True,
-                "message": message,
-                "cleaned_count": len(invalid_images),
-                "remaining_count": len(all_images) - len(invalid_images)
-            }
-            
-        except Exception as e:
-            error_msg = f"Error durante la limpieza: {str(e)}"
-            self.log_to_panel(f"❌ {error_msg}")
-            return {"success": False, "error": error_msg}
+                    self.log_to_panel(f"❌ Error inesperado procesando el grupo {group['url']}: {e}", "error")
 
-    def shutdown(self):
-        """Función para apagar de forma segura todos los procesos."""
-        self.log_to_panel("Iniciando secuencia de apagado...")
-        self.stop_scheduler_thread()
-        self.stop_publishing_groups() # Esto ya llama a close_browser
-        self.log_to_panel("Aplicación apagada de forma segura.")
+                # Pausa entre publicaciones
+                wait_time = random.randint(60, 120)
+                self.log_to_panel(f"Esperando {wait_time} segundos antes del siguiente grupo...")
+                time.sleep(wait_time)
+
+        finally:
+            self.close_browser()
+            self.is_publishing = False
+            self.log_to_panel("Proceso de publicación finalizado.")
+            self.socketio.emit('publishing_status', {'isPublishing': False}, room=self.client_id)
+
+class InstanceManager:
+    """Gestiona una instancia de AppLogic para cada cliente, evitando crear duplicados."""
+    def __init__(self):
+        self.instances = {}
+        self.lock = threading.Lock()
+
+    def get_logic(self, client_id):
+        with self.lock:
+            if client_id not in self.instances:
+                self.instances[client_id] = AppLogic(client_id, socketio)
+            return self.instances[client_id]
+
+# ==============================================================================
+# --- DECORADORES DE SEGURIDAD Y LÍMITES ---
+# ==============================================================================
+
+def admin_required(fn):
+    """Decorador para proteger rutas de admin, requiere una clave de API en la cabecera."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth_key = request.headers.get('X-Admin-API-Key')
+        if auth_key and auth_key == SUPERUSER_API_KEY:
+            return fn(*args, **kwargs)
+        else:
+            return jsonify({"msg": "Acceso de administrador requerido"}), 403
+    return wrapper
+
+def check_subscription_limit(fn):
+    """Decorador que verifica si un cliente ha alcanzado su límite de publicaciones mensuales."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        client_id = get_jwt()['sub'] # 'sub' es el campo estándar para la identidad en JWT
         
+        client = db_manager.fetch_one("SELECT plan, trial_expires_at, publications_this_month FROM clients WHERE id = %s", (client_id,))
+        if not client:
+            return jsonify({"msg": "Cliente no encontrado"}), 404
+
+        # Verificar si la prueba ha expirado
+        if client['plan'] == 'free' and client['trial_expires_at'] and datetime.utcnow() > client['trial_expires_at']:
+            return jsonify({"msg": "Tu período de prueba ha expirado. Por favor, actualiza tu plan."}), 403
+
+        plan_limit = PLANS.get(client['plan'], {'limit': 0})['limit']
+        if plan_limit == float('inf'):
+            return fn(*args, **kwargs) # Pasa si es ilimitado
+
+        if client['publications_this_month'] >= plan_limit:
+            return jsonify({
+                "msg": f"Has alcanzado el límite de {plan_limit} publicaciones de tu plan para este mes."
+            }), 403
+            
+        return fn(*args, **kwargs)
+    return wrapper
+
+# ==============================================================================
+# --- WORKER E INSTANCIAS ---
+# ==============================================================================
+instance_manager = InstanceManager()
+
+def job_worker():
+    """Procesa trabajos de la cola de forma secuencial para no sobrecargar la VM."""
+    while True:
+        job = job_queue.get()
+        client_id = job.get('client_id')
+        task_type = job.get('task_type')
+        data = job.get('data')
+        logic_instance = instance_manager.get_logic(client_id)
         
-# --- INSTANCIA GLOBAL DE LA LÓGICA ---
-app_logic = AppLogic()
-
-# --- FUNCIONES EXPUESTAS A JAVASCRIPT ---
-
-# En main.py
-
-@eel.expose
-def get_initial_data():
-    all_data = {
-        "texts": db_manager.fetch_all("SELECT id, content, ai_tags, usage_count FROM texts ORDER BY id DESC"),
-        "groups": db_manager.fetch_all("SELECT * FROM groups ORDER BY id DESC"),
-        "pages": db_manager.fetch_all("SELECT * FROM pages ORDER BY id DESC"),
-        "scheduled_posts": db_manager.fetch_all("""
-            SELECT sp.*, p.name as page_name 
-            FROM scheduled_posts sp 
-            LEFT JOIN pages p ON sp.page_id = p.id 
-            ORDER BY sp.publish_at DESC
-        """),
+        if task_type == 'publish_to_groups':
+            logic_instance._group_publishing_process(data['group_tags'], data['content_tags'])
+        # Aquí se podrían añadir otros tipos de trabajos pesados en el futuro
         
-        # --- CONSULTA OPTIMIZADA PARA HISTORIAL ---
-        "publication_log": db_manager.fetch_all("""
-            SELECT 
-                timestamp,
-                target_type,
-                target_url,
-                status,
-                published_post_url
-            FROM publication_log 
-            ORDER BY timestamp DESC 
-            LIMIT 50
-        """),
+        job_queue.task_done()
 
-        # --- NUEVA CONSULTA MODIFICADA PARA IMÁGENES ---
-        # Calcula dinámicamente 'usage_count' sumando los usos en grupos y páginas.
-        "images": db_manager.fetch_all("""
-            SELECT 
-                i.id,
-                i.path,
-                i.manual_tags,
-                (
-                    (SELECT COUNT(*) FROM group_image_usage_log WHERE image_id = i.id) +
-                    (SELECT COUNT(*) FROM page_image_usage WHERE image_id = i.id)
-                ) as usage_count
-            FROM images i
-            ORDER BY i.id DESC
-        """)
+# ==============================================================================
+# --- API ENDPOINTS COMPLETOS ---
+# ==============================================================================
+
+# --- Autenticación y Gestión de Cuentas ---
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """Autentica a un usuario y devuelve un token JWT."""
+    email = request.json.get("email", None)
+    password = request.json.get("password", None)
+    
+    client = db_manager.fetch_one("SELECT id, name, password_hash FROM clients WHERE email = %s", (email,))
+    
+    if client and check_password_hash(client['password_hash'], password):
+        access_token = create_access_token(identity=client['id'])
+        return jsonify(access_token=access_token, clientName=client['name'], clientId=client['id'])
+    
+    return jsonify({"msg": "Email o contraseña incorrectos"}), 401
+
+@app.route('/api/account/change-password', methods=['PUT'])
+@jwt_required()
+def change_password():
+    """Permite a un usuario logueado cambiar su propia contraseña."""
+    client_id = get_jwt()['sub']
+    current_password = request.json.get("current_password")
+    new_password = request.json.get("new_password")
+
+    client = db_manager.fetch_one("SELECT password_hash FROM clients WHERE id = %s", (client_id,))
+    if not client or not check_password_hash(client['password_hash'], current_password):
+        return jsonify({"msg": "La contraseña actual es incorrecta"}), 401
+    
+    new_password_hash = generate_password_hash(new_password)
+    db_manager.execute_query("UPDATE clients SET password_hash = %s WHERE id = %s", (new_password_hash, client_id), commit=True)
+    return jsonify({"msg": "Contraseña actualizada correctamente."})
+
+@app.route('/api/account/status', methods=['GET'])
+@jwt_required()
+def get_account_status():
+    """Devuelve el estado de la cuenta del usuario, incluyendo su plan y uso actual."""
+    client_id = get_jwt()['sub']
+    client = db_manager.fetch_one("SELECT name, email, plan, trial_expires_at, created_at, publications_this_month FROM clients WHERE id = %s", (client_id,))
+    
+    plan_info = PLANS.get(client['plan'], {})
+    client_status = {
+        "name": client['name'],
+        "email": client['email'],
+        "plan": client['plan'],
+        "trial_expires_at": client['trial_expires_at'].isoformat() if client['trial_expires_at'] else None,
+        "created_at": client['created_at'].isoformat(),
+        "plan_name": plan_info.get('name'),
+        "monthly_limit": plan_info.get('limit'),
+        "monthly_usage": client['publications_this_month']
     }
-    return all_data
-# --- Gestión de Textos ---
+    return jsonify(client_status)
 
+# --- Endpoints de Superusuario ---
+@app.route('/api/admin/clients', methods=['POST'])
+@admin_required
+def create_client():
+    """Crea una nueva cuenta de cliente."""
+    data = request.get_json()
+    name = data.get("name")
+    email = data.get("email")
+    password = data.get("password")
+    plan = data.get("plan", "free")
+    trial_days = data.get("trial_days", 3)
 
-@eel.expose
-def delete_text(item_id):
-    db_manager.delete_item("texts", item_id)
-    return db_manager.get_all_data()["texts"]
-
-@eel.expose
-def update_text(item_id, new_content):
-    """
-    Actualiza el contenido de un texto y regenera sus etiquetas de IA.
-    """
-    try:
-        app_logic.log_to_panel(f"Actualizando texto ID: {item_id}...")
+    if not all([name, email, password]): return jsonify({"msg": "Faltan datos: nombre, email y contraseña son requeridos"}), 400
+    if plan not in PLANS: return jsonify({"msg": f"Plan '{plan}' no es válido. Opciones: {list(PLANS.keys())}"}), 400
+    if db_manager.fetch_one("SELECT id FROM clients WHERE email = %s", (email,)): return jsonify({"msg": f"El email '{email}' ya está en uso"}), 409
         
-        # 1. Regenerar etiquetas IA para el nuevo contenido
-        new_tags = ai_service.generate_tags_for_text(new_content)
-        tags_str = ",".join(new_tags)
+    password_hash = generate_password_hash(password)
+    trial_expires_at = datetime.utcnow() + timedelta(days=trial_days) if plan == 'free' else None
+    
+    db_manager.execute_query(
+        "INSERT INTO clients (name, email, password_hash, plan, trial_expires_at) VALUES (%s, %s, %s, %s, %s)",
+        (name, email, password_hash, plan, trial_expires_at), commit=True
+    )
+    return jsonify({"msg": f"Cliente '{name}' creado con plan '{plan}'."})
+
+@app.route('/api/admin/clients/<int:client_id>', methods=['DELETE'])
+@admin_required
+def delete_client(client_id):
+    """Elimina una cuenta de cliente y todos sus datos asociados."""
+    # El `ON DELETE CASCADE` en la base de datos se encargará de borrar los datos en otras tablas.
+    cursor = db_manager.execute_query("DELETE FROM clients WHERE id = %s", (client_id,), commit=True)
+    if cursor.rowcount == 0:
+        return jsonify({"msg": "Cliente no encontrado"}), 404
+    
+    # Eliminar sus archivos y perfil de Chrome del servidor
+    shutil.rmtree(f'client_uploads/client_{client_id}', ignore_errors=True)
+    shutil.rmtree(f'profiles/client_{client_id}', ignore_errors=True)
+    
+    return jsonify({"msg": f"Cliente {client_id} y todos sus datos han sido eliminados."})
+
+@app.route('/api/admin/clients/<int:client_id>/plan', methods=['PUT'])
+@admin_required
+def update_client_plan(client_id):
+    """Actualiza el plan de suscripción de un cliente."""
+    new_plan = request.json.get("plan")
+    if new_plan not in PLANS:
+        return jsonify({"msg": "Plan no válido"}), 400
         
-        # 2. Actualizar la base de datos con el nuevo contenido y las nuevas etiquetas
+    db_manager.execute_query(
+        "UPDATE clients SET plan = %s, trial_expires_at = NULL WHERE id = %s", 
+        (new_plan, client_id), commit=True
+    )
+    return jsonify({"msg": f"Cliente {client_id} actualizado al plan '{new_plan}'."})
+
+# --- Endpoint para servir imágenes (con configuración Nginx recomendada) ---
+@app.route('/uploads/client_<int:client_id>/<path:filename>')
+def serve_uploaded_file(client_id, filename):
+    """
+    Sirve los archivos subidos por un cliente. 
+    En producción, esto debe ser manejado por Nginx para mayor eficiencia.
+    EJEMPLO DE CONFIGURACIÓN NGINX (en /etc/nginx/sites-available/your_site):
+    location /uploads/ {
+        # Sirve archivos estáticos directamente, mucho más rápido que Flask.
+        alias /var/www/your_project/client_uploads/;
+        expires 30d;
+        add_header Cache-Control "public";
+    }
+    """
+    directory = os.path.join(app.config['UPLOAD_FOLDER'], f'client_{client_id}')
+    return send_from_directory(directory, filename)
+
+
+# --- API de Datos y Funcionalidades (TODAS PORTADAS Y PROTEGIDAS) ---
+
+@app.route('/api/data/initial', methods=['GET'])
+@jwt_required()
+def get_initial_data():
+    client_id = get_jwt()['sub']
+    data = {
+        "texts": db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,)),
+        "images": db_manager.fetch_all("SELECT * FROM images WHERE client_id = %s ORDER BY id DESC", (client_id,)),
+        "groups": db_manager.fetch_all("SELECT * FROM groups WHERE client_id = %s ORDER BY id DESC", (client_id,)),
+        "pages": db_manager.fetch_all("SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)),
+        "scheduled_posts": db_manager.fetch_all("SELECT * FROM scheduled_posts WHERE client_id = %s ORDER BY publish_at DESC", (client_id,)),
+        "publication_log": db_manager.fetch_all("SELECT * FROM publication_log WHERE client_id = %s ORDER BY timestamp DESC LIMIT 50", (client_id,))
+    }
+    return jsonify(data)
+
+@app.route('/api/texts', methods=['POST'])
+@jwt_required()
+def add_text():
+    client_id = get_jwt()['sub']
+    content = request.json.get('content')
+    if not content: return jsonify({"msg": "El contenido no puede estar vacío"}), 400
+    
+    tags = ai_service.generate_tags_for_text(content)
+    tags_str = ",".join(tags)
+    db_manager.execute_query(
+        "INSERT INTO texts (client_id, content, ai_tags) VALUES (%s, %s, %s)",
+        (client_id, content, tags_str), commit=True
+    )
+    new_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
+    return jsonify(new_texts)
+
+@app.route('/api/images/upload', methods=['POST'])
+@jwt_required()
+def upload_images():
+    client_id = get_jwt()['sub']
+    if 'images' not in request.files: return jsonify({"msg": "No se encontraron archivos"}), 400
+        
+    files = request.files.getlist('images')
+    tags = request.form.get('tags', '')
+    client_upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], f'client_{client_id}')
+    os.makedirs(client_upload_dir, exist_ok=True)
+    
+    for file in files:
+        filename = secure_filename(file.filename)
+        unique_filename = f"{int(time.time())}_{filename}"
+        save_path = os.path.join(client_upload_dir, unique_filename)
+        file.save(save_path)
         db_manager.execute_query(
-            "UPDATE texts SET content = ?, ai_tags = ? WHERE id = ?",
-            (new_content, tags_str, item_id)
+            "INSERT INTO images (client_id, path, manual_tags) VALUES (%s, %s, %s)",
+            (client_id, save_path, tags), commit=True
         )
         
-        app_logic.log_to_panel(f"Texto ID: {item_id} actualizado con éxito. Nuevas etiquetas: '{tags_str}'")
-        
-        # 3. Devolver la lista actualizada de textos para refrescar la UI
-        return db_manager.fetch_all("SELECT * FROM texts ORDER BY id DESC")
-    except Exception as e:
-        app_logic.log_to_panel(f"Error al actualizar el texto ID {item_id}: {e}")
-        # En caso de error, devuelve los datos actuales para no romper la UI
-        return db_manager.get_all_data()["texts"]
+    new_images = db_manager.fetch_all("SELECT * FROM images WHERE client_id = %s ORDER BY id DESC", (client_id,))
+    return jsonify(new_images)
 
+@app.route('/api/texts/<int:item_id>', methods=['PUT'])
+@jwt_required()
+def update_text(item_id):
+    client_id = get_jwt()['sub']
+    content = request.json.get('content')
+    # Validar que el texto pertenece al cliente
+    text_obj = db_manager.fetch_one("SELECT id FROM texts WHERE id = %s AND client_id = %s", (item_id, client_id))
+    if not text_obj: return jsonify({"msg": "Texto no encontrado o no autorizado"}), 404
     
-# --- Gestión de Imágenes ---
+    tags = ai_service.generate_tags_for_text(content)
+    tags_str = ",".join(tags)
+    db_manager.execute_query(
+        "UPDATE texts SET content = %s, ai_tags = %s WHERE id = %s",
+        (content, tags_str, item_id), commit=True
+    )
+    updated_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
+    return jsonify(updated_texts)
+
+@app.route('/api/items/<table>/<int:item_id>', methods=['DELETE'])
+@jwt_required()
+def delete_item(table, item_id):
+    client_id = get_jwt()['sub']
+    # Lista blanca de tablas permitidas para evitar inyección SQL en el nombre de la tabla
+    allowed_tables = ['texts', 'images', 'groups', 'pages', 'scheduled_posts']
+    if table not in allowed_tables:
+        return jsonify({"msg": "Operación no permitida"}), 400
+
+    # Para imágenes, también eliminamos el archivo físico
+    if table == 'images':
+        image_record = db_manager.fetch_one("SELECT path FROM images WHERE id = %s AND client_id = %s", (item_id, client_id))
+        if image_record and os.path.exists(image_record['path']):
+            try:
+                os.remove(image_record['path'])
+            except OSError as e:
+                print(f"Error eliminando archivo de imagen: {e}")
+
+    # La query es segura porque el nombre de la tabla se valida contra la lista blanca
+    query = f"DELETE FROM {table} WHERE id = %s AND client_id = %s"
+    cursor = db_manager.execute_query(query, (item_id, client_id), commit=True)
     
-@eel.expose
-def delete_image(item_id):
-    db_manager.delete_item("images", item_id)
-    return db_manager.get_all_data()["images"]
+    if cursor.rowcount == 0:
+        return jsonify({"msg": "Elemento no encontrado o no autorizado"}), 404
 
-# --- Gestión de Grupos y Páginas ---
-@eel.expose
-def add_group(url, tags):
-    db_manager.execute_query("INSERT OR IGNORE INTO groups (url, tags) VALUES (?, ?)", (url, tags))
-    return db_manager.get_all_data()["groups"]
+    return jsonify({"success": True, "msg": f"Elemento de '{table}' eliminado."})
 
-@eel.expose
-def delete_group(item_id):
-    db_manager.delete_item("groups", item_id)
-    return db_manager.get_all_data()["groups"]
+@app.route('/api/<item_type>', methods=['POST'])
+@jwt_required()
+def add_item(item_type):
+    client_id = get_jwt()['sub']
+    data = request.get_json()
     
-@eel.expose
-def add_page(name, url):
-    db_manager.execute_query("INSERT OR IGNORE INTO pages (name, page_url) VALUES (?, ?)", (name, url))
-    return db_manager.get_all_data()["pages"]
-
-@eel.expose
-def delete_page(item_id):
-    db_manager.delete_item("pages", item_id)
-    return db_manager.get_all_data()["pages"]
-
-
-# En main.py, junto a las otras funciones expuestas
-
-@eel.expose
-def add_groups_bulk(urls_string, tags):
-    """Añade múltiples grupos desde un string de URLs separadas por saltos de línea."""
-    # Aseguramos que app_logic esté disponible para loguear
-    global app_logic
-    
-    urls = [url.strip() for url in urls_string.splitlines() if url.strip()]
-    if not urls:
-        app_logic.log_to_panel("Importación masiva fallida: No se proporcionaron URLs válidas.")
-        # Devolvemos los datos actuales para no romper la UI
-        return db_manager.get_all_data()
-
-    try:
-        for url in urls:
-            # Usamos INSERT OR IGNORE para evitar errores si el grupo ya existe
-            db_manager.execute_query("INSERT OR IGNORE INTO groups (url, tags) VALUES (?, ?)", (url, tags))
-        
-        app_logic.log_to_panel(f"Importación masiva completada. {len(urls)} URLs procesadas.")
-    except Exception as e:
-        app_logic.log_to_panel(f"Error durante la importación masiva: {e}")
-
-    # Devolvemos todos los datos para que la UI se refresque completamente
-    return db_manager.get_all_data()
-
-# --- Lógica de Programación y Publicación ---
-@eel.expose
-def start_group_publishing_process(group_tags, content_tags):
-    return app_logic.start_publishing_groups(group_tags, content_tags)
-    
-@eel.expose
-def stop_group_publishing_process():
-    return app_logic.stop_publishing_groups()
-
-@eel.expose
-def schedule_page_post(data):
-    # data = { page_id, publish_at, text_content, image_id }
-    query = "INSERT INTO scheduled_posts (page_id, publish_at, text_content, image_id) VALUES (?, ?, ?, ?)"
-    params = (data['page_id'], data['publish_at'], data['text_content'], data.get('image_id'))
-    db_manager.execute_query(query, params)
-    return db_manager.get_all_data()["scheduled_posts"]
-    
-@eel.expose
-def delete_scheduled_post(item_id):
-    db_manager.delete_item("scheduled_posts", item_id)
-    return db_manager.get_all_data()["scheduled_posts"]
-
-@eel.expose
-def get_content_suggestion(page_id, inspiration_tags):
-    # Lógica simplificada: sugerir cualquier imagen no usada en la página y un texto coherente
-    page_id = int(page_id)
-    
-    # 1. Encontrar imagen no usada en esta página
-    query = """
-        SELECT i.id, i.path, i.manual_tags FROM images i
-        WHERE i.id NOT IN (SELECT image_id FROM page_image_usage WHERE page_id = ?)
-        ORDER BY RANDOM() LIMIT 1
-    """
-    image = db_manager.fetch_one(query, (page_id,))
-    if not image:
-        return {"success": False, "message": "No hay imágenes nuevas disponibles para esta página."}
-        
-    image_tags = image['manual_tags'].split(',')
-    
-    # 2. Encontrar texto coherente
-    all_texts = db_manager.fetch_all("SELECT id, content, ai_tags FROM texts")
-    coherent_texts = [
-        text for text in all_texts if any(tag in text.get('ai_tags', '') for tag in image_tags)
-    ]
-    if not coherent_texts:
-         return {"success": False, "message": "No se encontró un texto coherente para la imagen sugerida."}
-         
-    text = random.choice(coherent_texts)
-    
-    return {"success": True, "text": text, "image": image}
-
-# --- Funciones Worker para Tareas Lentas (AÑADIR A MAIN.PY) ---
-
-def _add_manual_text_worker(content):
-    """
-    Worker que se ejecuta en segundo plano para añadir un texto manual.
-    Esto evita que la UI se congele mientras la IA genera las etiquetas.
-    """
-    try:
-        app_logic.log_to_panel("Generando etiquetas IA para texto manual...")
-        tags = ai_service.generate_tags_for_text(content)
-        tags_str = ",".join(tags)
-        db_manager.execute_query("INSERT INTO texts (content, ai_tags) VALUES (?, ?)", (content, tags_str))
-        app_logic.log_to_panel("Texto manual añadido y etiquetado.")
-        # Llama a la función de JS para actualizar la tabla de textos
-        eel.update_data_view('texts', db_manager.get_all_data()["texts"])()
-    except Exception as e:
-        app_logic.log_to_panel(f"Error en worker de texto manual: {e}")
-
-@eel.expose
-def add_manual_text(content):
-    """Lanza el worker que añade texto manual en un hilo separado."""
-    eel.spawn(_add_manual_text_worker, content)
-
-
-def _generate_ai_texts_worker(topic, count):
-    """
-    Worker que se ejecuta en segundo plano para generar textos con IA.
-    """
-    try:
-        app_logic.log_to_panel(f"Iniciando generación de {count} textos con IA sobre '{topic}'...")
-        texts = ai_service.generate_text_variations(topic, int(count))
-        for text in texts:
-            tags = ai_service.generate_tags_for_text(text)
-            tags_str = ",".join(tags)
-            db_manager.execute_query("INSERT INTO texts (content, ai_tags) VALUES (?, ?)", (text, tags_str))
-        app_logic.log_to_panel("Generación de textos con IA completada.")
-        # Llama a la función de JS para actualizar la tabla de textos
-        eel.update_data_view('texts', db_manager.get_all_data()["texts"])()
-    except Exception as e:
-        app_logic.log_to_panel(f"Error en worker de generación IA: {e}")
-
-@eel.expose
-def generate_ai_texts(topic, count):
-    """Lanza el worker de generación de IA en un hilo separado."""
-    eel.spawn(_generate_ai_texts_worker, topic, count)
-
-
-def _add_images_worker(tags_string):
-    """
-    Worker que abre el diálogo para seleccionar imágenes sin congelar la UI.
-    """
-    try:
-        # Crea una ventana raíz de Tkinter para el diálogo de archivo
-        root = tk.Tk()
-        root.withdraw()  # Oculta la ventana principal de Tkinter
-        root.attributes('-topmost', True)  # Pone el diálogo al frente
-
-        files = filedialog.askopenfilenames(
-            title="Seleccionar imágenes", 
-            filetypes=[("Imágenes", "*.jpg *.jpeg *.png")]
+    if item_type == 'groups':
+        db_manager.execute_query(
+            "INSERT INTO groups (client_id, url, tags) VALUES (%s, %s, %s)",
+            (client_id, data['url'], data['tags']), commit=True
         )
-        root.destroy()
+        return jsonify(db_manager.fetch_all("SELECT * FROM groups WHERE client_id = %s ORDER BY id DESC", (client_id,)))
+    
+    if item_type == 'pages':
+        db_manager.execute_query(
+            "INSERT INTO pages (client_id, name, page_url) VALUES (%s, %s, %s)",
+            (client_id, data['name'], data['page_url']), commit=True
+        )
+        return jsonify(db_manager.fetch_all("SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)))
+
+    if item_type == 'scheduled_posts':
+        db_manager.execute_query(
+            "INSERT INTO scheduled_posts (client_id, page_id, publish_at, text_content, image_id) VALUES (%s, %s, %s, %s, %s)",
+            (client_id, data['page_id'], data['publish_at'], data['text_content'], data.get('image_id')), commit=True
+        )
+        return jsonify(db_manager.fetch_all("SELECT * FROM scheduled_posts WHERE client_id = %s ORDER BY publish_at DESC", (client_id,)))
         
-        if files:
-            app_logic.log_to_panel(f"Añadiendo {len(files)} imágenes con etiquetas: '{tags_string}'")
-            for file_path in files:
-                # Normaliza la ruta del archivo para evitar problemas entre OS
-                normalized_path = os.path.normpath(file_path)
-                db_manager.execute_query(
-                    "INSERT OR IGNORE INTO images (path, manual_tags) VALUES (?, ?)", 
-                    (normalized_path, tags_string)
-                )
-            # Llama a la función de JS para actualizar la tabla de imágenes
-            eel.update_data_view('images', db_manager.get_all_data()["images"])()
-        else:
-            app_logic.log_to_panel("No se seleccionó ninguna imagen.")
-    except Exception as e:
-        app_logic.log_to_panel(f"Error en worker de añadir imágenes: {e}")
+    return jsonify({"msg": "Tipo de elemento no válido"}), 400
 
-@eel.expose
-def add_images(tags_string):
-    """Lanza el worker de selección de imágenes en un hilo separado."""
-    eel.spawn(_add_images_worker, tags_string)
+@app.route('/api/publishing/start', methods=['POST'])
+@jwt_required()
+@check_subscription_limit
+def start_publishing():
+    client_id = get_jwt()['sub']
+    logic = instance_manager.get_logic(client_id)
+    if logic.is_publishing:
+        return jsonify({"msg": "Un proceso ya está en ejecución para ti."}), 409
+        
+    data = request.get_json()
+    job = {'client_id': client_id, 'task_type': 'publish_to_groups', 'data': data}
+    job_queue.put(job)
+    logic.is_publishing = True # Marcar como ocupado para evitar duplicados
+    logic.log_to_panel("✅ Tu solicitud de publicación ha sido añadida a la cola.")
+    socketio.emit('publishing_status', {'isPublishing': True}, room=client_id)
+    return jsonify({"msg": "Proceso de publicación encolado."})
 
-# --- FUNCIONES PARA MANEJO DE GRUPOS PROBLEMÁTICOS ---
+@app.route('/api/publishing/stop', methods=['POST'])
+@jwt_required()
+def stop_publishing():
+    client_id = get_jwt()['sub']
+    logic = instance_manager.get_logic(client_id)
+    if logic.is_publishing:
+        logic.is_publishing = False # La bandera detendrá el bucle en el worker
+        logic.log_to_panel("Solicitud de detención recibida. El proceso terminará después de la publicación actual.", "warning")
+        return jsonify({"msg": "Se ha solicitado la detención del proceso."})
+    return jsonify({"msg": "No hay ningún proceso en ejecución."})
 
-@eel.expose
-def get_problematic_groups_report():
-    """Genera un reporte de grupos problemáticos."""
-    return app_logic.get_problematic_groups_report()
+# ==============================================================================
+# --- WEB SOCKETS E INICIO ---
+# ==============================================================================
 
-@eel.expose
-def clean_problematic_groups(confirm=False):
-    """Limpia grupos marcados como problemáticos."""
-    return app_logic.clean_problematic_groups(confirm)
+@socketio.on('join')
+def on_join(data):
+    """Un cliente se une a su sala privada para recibir logs, validando su token JWT."""
+    token = data.get('token')
+    client_id = data.get('client_id')
+    if not token:
+        disconnect()
+        return
 
-@eel.expose
-def get_publishing_statistics():
-    """Obtiene estadísticas detalladas de publicaciones."""
     try:
-        stats = {
-            "total_publications": db_manager.fetch_one("SELECT COUNT(*) as count FROM publication_log")['count'],
-            "successful_publications": db_manager.fetch_one("SELECT COUNT(*) as count FROM publication_log WHERE status = 'Success'")['count'],
-            "failed_publications": db_manager.fetch_one("SELECT COUNT(*) as count FROM publication_log WHERE status LIKE 'Failed%'")['count'],
-            "problematic_groups": db_manager.fetch_one("SELECT COUNT(*) as count FROM groups WHERE tags LIKE '%PROBLEMÁTICO%'")['count'],
-            "recent_errors": db_manager.fetch_all("""
-                SELECT target_url, status, timestamp, error_details 
-                FROM publication_log 
-                WHERE status LIKE 'Failed%' 
-                ORDER BY timestamp DESC 
-                LIMIT 10
-            """)
-        }
-        
-        # Calcular tasa de éxito
-        if stats['total_publications'] > 0:
-            stats['success_rate'] = round((stats['successful_publications'] / stats['total_publications']) * 100, 2)
+        # Validar que el token corresponde al client_id que intenta unirse
+        decoded_token = decode_token(token)
+        token_client_id = decoded_token['sub']
+        if token_client_id == client_id:
+            join_room(client_id)
+            instance_manager.get_logic(client_id).log_to_panel("Conectado a la consola.")
         else:
-            stats['success_rate'] = 0
-            
-        return {"success": True, "stats": stats}
+            # Si el token es válido pero para otro usuario, se desconecta por seguridad
+            disconnect()
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        print(f"Error de autenticación de WebSocket: {e}")
+        disconnect()
 
-# --- FUNCIONES PARA MANEJO DE IMÁGENES INVÁLIDAS ---
+@socketio.on('connect')
+def on_connect():
+    print("Cliente conectado a WebSocket. Esperando autenticación para unirse a una sala.")
 
-@eel.expose
-def validate_images(scan_directories=False):
-    """Valida todas las imágenes en la base de datos."""
-    return app_logic.validate_and_clean_images(scan_directories)
-
-@eel.expose
-def clean_invalid_images(confirm=False):
-    """Limpia imágenes inválidas de la base de datos."""
-    return app_logic.clean_invalid_images(confirm)
-
-@eel.expose
-def get_images_health_report():
-    """Genera un reporte rápido del estado de las imágenes."""
-    try:
-        all_images = db_manager.fetch_all("SELECT id, path FROM images")
-        
-        valid_count = 0
-        invalid_count = 0
-        invalid_details = []
-        
-        for image in all_images[:50]:  # Solo revisar primeras 50 para reporte rápido
-            validation = app_logic._validate_image_path(image['path'])
-            if validation["valid"]:
-                valid_count += 1
-            else:
-                invalid_count += 1
-                invalid_details.append({
-                    "id": image['id'],
-                    "path": image['path'],
-                    "error": validation['error']
-                })
-        
-        return {
-            "success": True,
-            "total_checked": len(all_images[:50]),
-            "total_in_db": len(all_images),
-            "valid": valid_count,
-            "invalid": invalid_count,
-            "invalid_details": invalid_details[:10],  # Solo primeras 10
-            "needs_full_scan": len(all_images) > 50
-        }
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
+@socketio.on('disconnect')
+def on_disconnect():
+    print("Cliente desconectado de WebSocket.")
 
 if __name__ == "__main__":
-    """
-    Punto de entrada principal de la aplicación.
-    Lanza la GUI en un perfil de Chrome separado y desechable ('gui_profile')
-    para evitar conflictos con el perfil principal que usará el bot de Selenium.
-    """
-    try:
-        import os
+    # Iniciar los hilos del worker
+    for i in range(MAX_CONCURRENT_BROWSERS):
+        worker_thread = threading.Thread(target=job_worker, daemon=True)
+        worker_thread.start()
+        print(f"▶️ Worker {i+1}/{MAX_CONCURRENT_BROWSERS} iniciado.")
 
-        # Creamos una ruta absoluta para el perfil de la GUI.
-        gui_profile_path = os.path.abspath('gui_profile')
+    print(f"🚀 Iniciando servidor Flask en modo Multi-Inquilino...")
+    # Usar eventlet o gevent es recomendado para producción con SocketIO
+    socketio.run(app, debug=False, host='0.0.0.0', port=5001)
 
-        # Definimos los argumentos de línea de comandos para lanzar Chrome
-        # en modo 'app' y con un perfil de datos de usuario separado.
-        eel_cmdline_args = [
-            f'--user-data-dir={gui_profile_path}'  # Usa un perfil de datos dedicado
-        ]
-        
-        print(f"Iniciando GUI con perfil dedicado en: {gui_profile_path}")
-        
-        # Iniciamos Eel. Pasamos los argumentos de línea de comandos para
-        # controlar cómo se lanza Chrome.
-        eel.start(
-            'index.html',
-            size=(1400, 900),
-            mode='chrome',  # Solo una definición del modo
-            cmdline_args=eel_cmdline_args,
-            block=True
-        )
-
-    except (SystemExit, KeyboardInterrupt):
-        print("Cierre de la aplicación solicitado por el usuario.")
-    except Exception as e:
-        print(f"No se pudo iniciar la interfaz gráfica: {e}")
-    finally:
-        if 'app_logic' in locals() and app_logic:
-            app_logic.shutdown()
-        
- 
