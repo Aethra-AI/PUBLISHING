@@ -720,6 +720,58 @@ def update_text(item_id):
     db_manager.execute_query("UPDATE texts SET content = %s, ai_tags = %s WHERE id = %s", (content, tags_str, item_id), commit=True)
     updated_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
     return jsonify(updated_texts)
+
+
+
+@app.route('/api/texts/generate-ai', methods=['POST'])
+@jwt_required()
+def generate_ai_texts():
+    """
+    Genera textos usando IA, los guarda en la base de datos y devuelve la lista completa.
+    """
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
+    
+    data = request.get_json()
+    topic = data.get('topic')
+    count = data.get('count', 5)
+
+    if not topic:
+        return jsonify({"msg": "Se requiere un tema para la generación."}), 400
+
+    try:
+        # 1. Llamar al servicio de IA para generar los textos (NOMBRE DE FUNCIÓN CORREGIDO)
+        print(f"Generando {count} textos para el cliente {client_id} sobre el tema: '{topic}'")
+        generated_texts = ai_service.generate_text_variations(topic, count) # <-- ¡ESTA ES LA LÍNEA CORREGIDA!
+        
+        # 2. Guardar cada texto generado en la base de datos
+        for text_content in generated_texts:
+            # Intentar generar etiquetas para cada texto individualmente
+            try:
+                tags = ai_service.generate_tags_for_text(text_content)
+                tags_str = ",".join(tags) if tags else ""
+            except Exception as e_tags:
+                print(f"ADVERTENCIA: Falló la generación de etiquetas por IA para un texto: {e_tags}")
+                tags_str = ""
+            
+            db_manager.execute_query(
+                "INSERT INTO texts (client_id, content, ai_tags) VALUES (%s, %s, %s)",
+                (client_id, text_content, tags_str),
+                commit=True
+            )
+        
+        # 3. Devolver la lista actualizada de todos los textos del cliente
+        new_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
+        return jsonify(new_texts)
+
+    except Exception as e:
+        print(f"ERROR: Falló la generación de textos con IA: {e}")
+        return jsonify({"msg": f"Error al generar textos: {str(e)}"}), 500
+
+
 @app.route('/api/items/<table>/<int:item_id>', methods=['DELETE'])
 @jwt_required()
 def delete_item(table, item_id):
