@@ -240,46 +240,75 @@ class AppLogic:
                 time.sleep(5) # Esperar antes de reintentar
         return {"success": False, "error": "Fallaron todos los reintentos de publicación."}
     
+
     def _find_coherent_pair_for_group(self, content_tags_str):
-        """Encuentra un par de texto e imagen coherentes y disponibles para este cliente."""
+        """
+        Encuentra un par de texto e imagen coherentes y menos usados para este cliente,
+        basado en una lista de etiquetas de contenido.
+        """
+        # 1. Limpiar y validar las etiquetas de entrada
         content_tags = [tag.strip() for tag in content_tags_str.split(',') if tag.strip()]
         if not content_tags:
-            self.log_to_panel("No se proporcionaron etiquetas de contenido válidas.", "warning")
+            self.log_to_panel("No se proporcionaron etiquetas de contenido válidas para la búsqueda.", "warning")
             return None, None
 
-        # Construir la parte de la query para las etiquetas
-        text_tags_query_part = " OR ".join(["ai_tags LIKE %s" for _ in content_tags])
-        image_tags_query_part = " OR ".join(["manual_tags LIKE %s" for _ in content_tags])
-        
-        # Parámetros para las queries (repetidos para texto e imagen)
-        params = (self.client_id,) + tuple([f"%{tag}%" for tag in content_tags])
+        self.log_to_panel(f"Buscando contenido con etiquetas: {', '.join(content_tags)}...")
 
-        # Buscar el texto menos usado que coincida con las etiquetas
+        # 2. Construir dinámicamente la parte de la query SQL para las etiquetas
+        #    Esto previene inyección SQL ya que los valores se pasan como parámetros.
+        #    Ejemplo: "ai_tags LIKE %s OR ai_tags LIKE %s"
+        tags_query_part = " OR ".join(["ai_tags LIKE %s" for _ in content_tags])
+    
+        # 3. Preparar los parámetros para la query. El formato %tag% busca la etiqueta en cualquier parte del string.
+        #    Ejemplo: ('%coche%', '%venta%')
+        params_like = tuple([f"%{tag}%" for tag in content_tags])
+     
+        # 4. Construir y ejecutar la query para encontrar el texto menos usado que coincida
         text_query = f"""
             SELECT * FROM texts 
-            WHERE client_id = %s AND ({text_tags_query_part})
-            ORDER BY usage_count ASC, RAND() LIMIT 1
+            WHERE client_id = %s AND ({tags_query_part})
+            ORDER BY usage_count ASC, RAND() 
+            LIMIT 1
         """
-        text = db_manager.fetch_one(text_query, params)
+        text_params = (self.client_id,) + params_like
+        text = db_manager.fetch_one(text_query, text_params)
 
-        # Buscar la imagen menos usada que coincida con las etiquetas
-        image_query = f"""
-            SELECT i.*, COUNT(pl.id) as usage_count
-            FROM images i
-            LEFT JOIN publication_log pl ON i.id = pl.image_id AND pl.client_id = %s
-            WHERE i.client_id = %s AND ({image_tags_query_part})
-            GROUP BY i.id
-            ORDER BY usage_count ASC, RAND() LIMIT 1
-        """
-        # Los parámetros para la query de imagen necesitan el client_id dos veces
-        image_params = (self.client_id,) + params
-        image = db_manager.fetch_one(image_query, image_params)
+        if not text:
+            self.log_to_panel("No se encontraron textos que coincidan con las etiquetas.", "warning")
+            return None, None
+
+        # 5. Ahora, buscar una imagen coherente usando las etiquetas del texto encontrado.
+        #    Esto asegura una mayor coherencia. Usamos las etiquetas IA del texto.
+        image_tags_str = text.get('ai_tags', '')
+        image_tags = [tag.strip() for tag in image_tags_str.split(',') if tag.strip()]
+    
+        if not image_tags:
+            self.log_to_panel(f"El texto ID {text['id']} no tiene etiquetas IA para buscar una imagen. Buscando imagen aleatoria.", "warning")
+            # Plan B: Si el texto no tiene etiquetas, busca una imagen aleatoria.
+            image = db_manager.fetch_one("SELECT * FROM images WHERE client_id = %s ORDER BY RAND() LIMIT 1", (self.client_id,))
+        else:
+            image_tags_query_part = " OR ".join(["manual_tags LIKE %s" for _ in image_tags])
+            image_params_like = tuple([f"%{tag}%" for tag in image_tags])
+        
+            image_query = f"""
+                SELECT * FROM images 
+                WHERE client_id = %s AND ({image_tags_query_part})
+                ORDER BY RAND() 
+                LIMIT 1
+            """
+            image_params = (self.client_id,) + image_params_like
+            image = db_manager.fetch_one(image_query, image_params)
+
+        if not image:
+            self.log_to_panel("No se encontró una imagen coherente. Buscando cualquier imagen disponible como último recurso.", "warning")
+            # Plan C: Si no hay imagen coherente, busca CUALQUIER imagen del cliente.
+            image = db_manager.fetch_one("SELECT * FROM images WHERE client_id = %s ORDER BY RAND() LIMIT 1", (self.client_id,))
 
         if text and image:
-            self.log_to_panel(f"Par encontrado: Texto ID {text['id']}, Imagen ID {image['id']}", "info")
+            self.log_to_panel(f"Par de contenido encontrado: Texto ID {text['id']}, Imagen ID {image['id']}", "info")
             return text, image
-        
-        self.log_to_panel("No se pudo encontrar un par coherente de texto e imagen.", "warning")
+    
+        self.log_to_panel("Fallo al encontrar un par de contenido válido (Texto o Imagen no disponibles).", "error")
         return None, None
 
     def _group_publishing_process(self, group_tags, content_tags):
@@ -629,10 +658,16 @@ def add_text():
     content = request.json.get('content')
     if not content: return jsonify({"msg": "El contenido no puede estar vacío"}), 400
     
-    # tags = ai_service.generate_tags_for_text(content) # Descomenta si usas ai_service
-    tags = ["generado", "ia"] # Placeholder si ai_service no está listo
-    tags_str = ",".join(tags)
+    try:
+        tags = ai_service.generate_tags_for_text(content)
+        tags_str = ",".join(tags) if tags else ""
+    except Exception as e:
+        print(f"ADVERTENCIA: Falló la generación de etiquetas por IA: {e}")
+        tags_str = "" # Continuar sin etiquetas en caso de error de la IA
+
     
+
+
     db_manager.execute_query("INSERT INTO texts (client_id, content, ai_tags) VALUES (%s, %s, %s)", (client_id, content, tags_str), commit=True)
     new_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
     return jsonify(new_texts)
@@ -675,8 +710,12 @@ def update_text(item_id):
     if not text_obj: return jsonify({"msg": "Texto no encontrado o no autorizado"}), 404
     
     # tags = ai_service.generate_tags_for_text(content) # Descomenta si usas ai_service
-    tags = ["editado", "ia"] # Placeholder
-    tags_str = ",".join(tags)
+    try:
+        tags = ai_service.generate_tags_for_text(content)
+        tags_str = ",".join(tags) if tags else ""
+    except Exception as e:
+        print(f"ADVERTENCIA: Falló la generación de etiquetas por IA al actualizar: {e}")
+        tags_str = ""
 
     db_manager.execute_query("UPDATE texts SET content = %s, ai_tags = %s WHERE id = %s", (content, tags_str, item_id), commit=True)
     updated_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
