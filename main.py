@@ -564,20 +564,50 @@ def serve_uploaded_file(client_id, filename):
 
 # --- API de Datos y Funcionalidades (TODAS PORTADAS Y PROTEGIDAS) ---
 
+# main.py
+
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# ====== BLOQUE COMPLETO PARA REEMPLAZAR (get_initial_data) ======
+# =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
 @app.route('/api/data/initial', methods=['GET'])
-@jwt_required()
+@jwt_required() 
 def get_initial_data():
+    """
+    Recopila y devuelve todos los datos iniciales necesarios para que el cliente
+    cargue su panel de control.
+    """
+    # 1. Obtiene el ID del cliente de forma segura desde el token JWT validado.
     client_id = get_jwt()['sub']
+    
+    # 2. Obtiene la información básica del cliente.
     client_info = db_manager.fetch_one("SELECT id, name FROM clients WHERE id=%s", (client_id,))
+    
+    # 3. Recopila todos los datos asociados a ese client_id.
+    #    Las consultas están completas y ordenadas para una mejor visualización.
     data = {
         "client_info": client_info,
-        "texts": db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,)),
-        "images": db_manager.fetch_all("SELECT * FROM images WHERE client_id = %s ORDER BY id DESC", (client_id,)),
-        "groups": db_manager.fetch_all("SELECT * FROM groups WHERE client_id = %s ORDER BY id DESC", (client_id,)),
-        "pages": db_manager.fetch_all("SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)),
-        "scheduled_posts": db_manager.fetch_all("SELECT sp.*, p.name as page_name FROM scheduled_posts sp LEFT JOIN pages p ON sp.page_id = p.id WHERE sp.client_id = %s ORDER BY sp.publish_at DESC", (client_id,)),
-        "publication_log": db_manager.fetch_all("SELECT * FROM publication_log WHERE client_id = %s ORDER BY timestamp DESC LIMIT 50", (client_id,))
+        "texts": db_manager.fetch_all(
+            "SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,)
+        ),
+        "images": db_manager.fetch_all(
+            "SELECT * FROM images WHERE client_id = %s ORDER BY id DESC", (client_id,)
+        ),
+        "groups": db_manager.fetch_all(
+            "SELECT * FROM groups WHERE client_id = %s ORDER BY id DESC", (client_id,)
+        ),
+        "pages": db_manager.fetch_all(
+            "SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)
+        ),
+        "scheduled_posts": db_manager.fetch_all(
+            "SELECT sp.*, p.name as page_name FROM scheduled_posts sp LEFT JOIN pages p ON sp.page_id = p.id WHERE sp.client_id = %s ORDER BY sp.publish_at DESC", (client_id,)
+        ),
+        "publication_log": db_manager.fetch_all(
+            "SELECT * FROM publication_log WHERE client_id = %s ORDER BY timestamp DESC LIMIT 50", (client_id,)
+        )
     }
+
+    # 4. Devuelve el paquete completo de datos al frontend.
     return jsonify(data)
 
 @app.route('/api/texts', methods=['POST'])
