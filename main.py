@@ -54,21 +54,18 @@ jwt = JWTManager(app)
 # Esta función se ejecuta cada vez que se accede a una ruta protegida.
 # Carga el usuario desde la BD basado en la identidad del token.
 # Si el usuario no existe (ej. fue eliminado), el token se considera inválido.
-# ======================================================
-# ====== BLOQUE PARA REEMPLAZAR (user_lookup_loader) ======
-# ======================================================
+
 @jwt.user_lookup_loader
 def user_lookup_callback(_jwt_header, jwt_data):
-    identity = jwt_data["sub"]
-    user = db_manager.fetch_one("SELECT * FROM clients WHERE id = %s", (identity,))
-    
-    # ¡Paso Clave! Si el usuario existe, nos aseguramos de que sea serializable
-    if user:
-        # Convertir cualquier objeto datetime a string formato ISO
-        for key, value in user.items():
-            if isinstance(value, (datetime, date)):
-                user[key] = value.isoformat()
-    return user
+    """
+    Esta función se llama en cada petición protegida.
+    'sub' contiene la identidad que pusimos en `create_access_token`, que es el client_id.
+    """
+    identity = jwt_data.get("sub")
+    if identity is None:
+        return None # No hay identidad en el token
+        
+    return db_manager.fetch_one("SELECT * FROM clients WHERE id = %s", (identity,))
 
 # Esta función define qué objeto se obtiene al llamar a `get_current_user()`
 # en una ruta protegida. La usaremos ahora.
@@ -384,25 +381,28 @@ def admin_required(fn):
             return jsonify({"msg": "Acceso de administrador requerido"}), 403
     return wrapper
 
-def check_subscription_limit(fn):
-    """Decorador que verifica si un cliente ha alcanzado su límite de publicaciones mensuales."""
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        client_id = get_jwt()['sub'] # 'sub' es el campo estándar para la identidad en JWT
-        
-        client = db_manager.fetch_one("SELECT plan, trial_expires_at, publications_this_month FROM clients WHERE id = %s", (client_id,))
-        if not client:
-            return jsonify({"msg": "Cliente no encontrado"}), 404
 
+def check_subscription_limit(fn):
+    @wraps(fn)
+    @jwt_required() # Aseguramos que se ejecute en rutas protegidas
+    def wrapper(*args, **kwargs):
+        current_user = get_current_user()
+        if not current_user:
+            # Esto es redundante porque el user_loader ya lo valida, pero es seguro.
+            return jsonify({"msg": "Usuario no encontrado para el token"}), 404
+
+        # Los datos del usuario ya están cargados en `current_user`
+        client_plan = current_user['plan']
+        trial_expires_at = current_user.get('trial_expires_at')
+        publications_this_month = current_user['publications_this_month']
+        
         # Verificar si la prueba ha expirado
-        if client['plan'] == 'free' and client['trial_expires_at'] and datetime.utcnow() > client['trial_expires_at']:
+        if client_plan == 'free' and trial_expires_at and datetime.utcnow() > trial_expires_at:
             return jsonify({"msg": "Tu período de prueba ha expirado. Por favor, actualiza tu plan."}), 403
 
-        plan_limit = PLANS.get(client['plan'], {'limit': 0})['limit']
-        if plan_limit == float('inf'):
-            return fn(*args, **kwargs) # Pasa si es ilimitado
-
-        if client['publications_this_month'] >= plan_limit:
+        plan_limit = PLANS.get(client_plan, {'limit': 0})['limit']
+        
+        if publications_this_month >= plan_limit:
             return jsonify({
                 "msg": f"Has alcanzado el límite de {plan_limit} publicaciones de tu plan para este mes."
             }), 403
@@ -436,27 +436,24 @@ def job_worker():
 
 # --- Autenticación y Gestión de Cuentas ---
 
+# ======================================================
+# ====== BLOQUE PARA REEMPLAZAR (función login) ======
+# ======================================================
 @app.route('/api/auth/login', methods=['POST'])
 def login():
-    """Autentica a un usuario y devuelve un token JWT."""
     email = request.json.get("email", None)
     password = request.json.get("password", None)
     
     client = db_manager.fetch_one("SELECT * FROM clients WHERE email = %s", (email,))
     
     if client and check_password_hash(client['password_hash'], password):
-        # Limpiar el objeto client antes de crear el token
-        # Esto evita que tipos de datos no serializables (como datetime)
-        # entren en la identidad del token.
-        identity_client = client.copy()
-        for key, value in identity_client.items():
-            if isinstance(value, (datetime, date)):
-                identity_client[key] = value.isoformat()
-
-        access_token = create_access_token(identity=identity_client)
+        # ¡LA CLAVE! La identidad del token es SÓLO el ID del cliente. Nada más.
+        access_token = create_access_token(identity=client['id'])
         return jsonify(access_token=access_token, clientName=client['name'], clientId=client['id'])
     
     return jsonify({"msg": "Email o contraseña incorrectos"}), 401
+
+
 @app.route('/api/account/change-password', methods=['PUT'])
 @jwt_required()
 def change_password():
@@ -710,7 +707,6 @@ def add_item(item_type):
     return jsonify({"msg": "Tipo de elemento no válido"}), 400
 
 @app.route('/api/publishing/start', methods=['POST'])
-@jwt_required()
 @check_subscription_limit
 def start_publishing():
     current_user = get_current_user()
