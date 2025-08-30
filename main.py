@@ -420,7 +420,7 @@ def login():
     client = db_manager.fetch_one("SELECT id, name, password_hash FROM clients WHERE email = %s", (email,))
     
     if client and check_password_hash(client['password_hash'], password):
-        access_token = create_access_token(identity=client['id'])
+        access_token = create_access_token(identity=int(client['id']))
         return jsonify(access_token=access_token, clientName=client['name'], clientId=client['id'])
     
     return jsonify({"msg": "Email o contraseña incorrectos"}), 401
