@@ -54,10 +54,21 @@ jwt = JWTManager(app)
 # Esta función se ejecuta cada vez que se accede a una ruta protegida.
 # Carga el usuario desde la BD basado en la identidad del token.
 # Si el usuario no existe (ej. fue eliminado), el token se considera inválido.
+# ======================================================
+# ====== BLOQUE PARA REEMPLAZAR (user_lookup_loader) ======
+# ======================================================
 @jwt.user_lookup_loader
 def user_lookup_callback(_jwt_header, jwt_data):
     identity = jwt_data["sub"]
-    return db_manager.fetch_one("SELECT id, name, plan FROM clients WHERE id = %s", (identity,))
+    user = db_manager.fetch_one("SELECT * FROM clients WHERE id = %s", (identity,))
+    
+    # ¡Paso Clave! Si el usuario existe, nos aseguramos de que sea serializable
+    if user:
+        # Convertir cualquier objeto datetime a string formato ISO
+        for key, value in user.items():
+            if isinstance(value, (datetime, date)):
+                user[key] = value.isoformat()
+    return user
 
 # Esta función define qué objeto se obtiene al llamar a `get_current_user()`
 # en una ruta protegida. La usaremos ahora.
@@ -424,20 +435,28 @@ def job_worker():
 # ==============================================================================
 
 # --- Autenticación y Gestión de Cuentas ---
+
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     """Autentica a un usuario y devuelve un token JWT."""
     email = request.json.get("email", None)
     password = request.json.get("password", None)
     
-    client = db_manager.fetch_one("SELECT id, name, password_hash FROM clients WHERE email = %s", (email,))
+    client = db_manager.fetch_one("SELECT * FROM clients WHERE email = %s", (email,))
     
     if client and check_password_hash(client['password_hash'], password):
-        access_token = create_access_token(identity=client)
+        # Limpiar el objeto client antes de crear el token
+        # Esto evita que tipos de datos no serializables (como datetime)
+        # entren en la identidad del token.
+        identity_client = client.copy()
+        for key, value in identity_client.items():
+            if isinstance(value, (datetime, date)):
+                identity_client[key] = value.isoformat()
+
+        access_token = create_access_token(identity=identity_client)
         return jsonify(access_token=access_token, clientName=client['name'], clientId=client['id'])
     
     return jsonify({"msg": "Email o contraseña incorrectos"}), 401
-
 @app.route('/api/account/change-password', methods=['PUT'])
 @jwt_required()
 def change_password():
