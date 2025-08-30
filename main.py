@@ -845,22 +845,25 @@ def add_scheduled_post():
     return jsonify(db_manager.fetch_all("SELECT sp.*, p.name as page_name FROM scheduled_posts sp LEFT JOIN pages p ON sp.page_id = p.id WHERE sp.client_id = %s ORDER BY sp.publish_at DESC", (client_id,)))
 
 
+# main.py
+
+
 @app.route('/api/publishing/start', methods=['POST'])
 @jwt_required()
 @check_subscription_limit
 def start_publishing():
-    # Obtenemos el client_id del token. Ahora SÍ lo usaremos.
+    # Obtenemos el client_id del token.
     client_id_raw = get_jwt().get('sub')
     try:
         client_id = int(client_id_raw)
     except (TypeError, ValueError):
         return jsonify({"msg": "Token inválido."}), 401
 
-    # Verificamos si ya hay una instancia de lógica para este cliente.
-    # Creamos una si no existe.
-    if client_id not in instance_manager:
-        instance_manager[client_id] = AppLogic(client_id, socketio)
-    logic = instance_manager[client_id]
+    # --- LÍNEA CORREGIDA ---
+    # En lugar de verificar si el cliente está en el gestor,
+    # obtenemos directamente su instancia de lógica.
+    # El método .get_logic() se encarga de crearla si no existe.
+    logic = instance_manager.get_logic(client_id)
 
     # Evitamos que se encolen múltiples trabajos para el mismo cliente.
     if logic.is_publishing:
@@ -888,6 +891,7 @@ def start_publishing():
     
     return jsonify({"msg": "Proceso de publicación encolado."})
 
+
 @app.route('/api/publishing/stop', methods=['POST'])
 @jwt_required()
 def stop_publishing():
@@ -897,15 +901,18 @@ def stop_publishing():
     except (TypeError, ValueError):
         return jsonify({"msg": "Token inválido."}), 401
 
-    # Verificamos si existe una instancia para este cliente y si está publicando.
-    if client_id in instance_manager and instance_manager[client_id].is_publishing:
-        logic = instance_manager[client_id]
-        # Cambiar la bandera es suficiente para que el bucle del worker se detenga.
+    # --- LÍNEA CORREGIDA (para consistencia) ---
+    # Aquí también usamos el método get_logic para ser consistentes.
+    logic = instance_manager.get_logic(client_id)
+    
+    if logic.is_publishing:
         logic.is_publishing = False
         logic.log_to_panel("Solicitud de detención recibida. El proceso terminará después de la publicación actual.", "warning")
         return jsonify({"msg": "Se ha solicitado la detención del proceso."})
     
     return jsonify({"msg": "No hay ningún proceso en ejecución para detener."})
+
+
 # ==============================================================================
 # --- WEB SOCKETS E INICIO ---
 # ==============================================================================
