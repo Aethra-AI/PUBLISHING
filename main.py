@@ -435,103 +435,62 @@ def cleanup_all_sessions():
 atexit.register(cleanup_all_sessions)
 
 
-
 @app.route('/api/publishing/init-login', methods=['POST'])
 @jwt_required()
 def init_facebook_login():
-    """
-    Inicia una sesión VNC con un navegador para el login manual del usuario.
-    Devuelve los datos de conexión para el frontend.
-    """
-    client_id_raw = get_jwt().get('sub')
-    try:
-        client_id = int(client_id_raw)
-    except (TypeError, ValueError):
-        return jsonify({"msg": "Token inválido."}), 401
-    
+    client_id = int(get_jwt().get('sub'))
     logic = instance_manager.get_logic(client_id)
-    if logic.is_publishing:
-        return jsonify({"msg": "No se puede iniciar sesión mientras se publica."}), 409
-
-    # Limpiar sesión anterior
-    if client_id in active_sessions:
-        procs = active_sessions.pop(client_id, {})
-        if procs.get('vnc'): procs.get('vnc').terminate()
-        if procs.get('websockify'): procs.get('websockify').terminate()
-        logic.log_to_panel("Cerrando sesión de login anterior.", "info")
+    if logic.is_publishing: return jsonify({"msg": "Publicación en curso."}), 409
     
-    # --- Configuración ---
-    vnc_port_display = random.randint(1, 100)
-    display_str = f":{vnc_port_display}"
-    vnc_port_tcp = 5900 + vnc_port_display
-    websockify_port = random.randint(6001, 7000)
-    vnc_password = secrets.token_hex(8)
+    # Limpieza de sesión anterior
+    if client_id in active_sessions:
+        for proc in active_sessions.pop(client_id, {}).values():
+            if proc and proc.poll() is None: proc.terminate()
+        logic.log_to_panel("Cerrando sesión anterior.", "info")
 
-    # --- Archivo de contraseña para VNC ---
-    # Es la forma más fiable de pasar la contraseña
-    vnc_pass_file = f'/tmp/vnc_pass_{client_id}'
-    with open(vnc_pass_file, 'w') as f:
-        f.write(vnc_password)
-    os.chmod(vnc_pass_file, 0o600)
+    vnc_display = random.randint(1, 100); display_str = f":{vnc_display}"
+    vnc_tcp_port = 5900 + vnc_display
+    ws_port = random.randint(6001, 7000)
+    vnc_password = secrets.token_hex(8)
+    
+    # Crear archivo de contraseña
+    pass_file = f'/tmp/vnc_pass_{client_id}'; open(pass_file, 'w').write(vnc_password); os.chmod(pass_file, 0o600)
 
     try:
-        # --- Comando VNC Moderno y Robusto ---
-        # Usamos tigervncserver directamente, que maneja mejor los entornos de servidor
-        vnc_command = [
-            '/usr/bin/tigervncserver',
-            display_str,
-            '-localhost',
-            '-fg',
-            '-geometry', '1280x800',
-            '-depth', '24',
-            '-passwd', vnc_pass_file,
-            '-xstartup', '/usr/bin/startxfce4' # Le decimos explícitamente que inicie el escritorio XFCE
-        ]
+        # --- Comandos como strings para shell=True ---
+        vnc_cmd_str = f"/usr/bin/tigervncserver {display_str} -localhost -fg -geometry 1280x800 -depth 24 -passwd {pass_file} -xstartup /usr/bin/startxfce4"
+        ws_cmd_str = f"/usr/bin/websockify {ws_port} localhost:{vnc_tcp_port}"
         
-        # --- Comando websockify ---
-        websockify_command = [
-            '/usr/bin/websockify',
-            str(websockify_port),
-            f'localhost:{vnc_port_tcp}'
-        ]
+        # Entorno para Chrome
+        chrome_env = os.environ.copy(); chrome_env['DISPLAY'] = display_str
+        chrome_cmd_list = ['google-chrome', '--no-sandbox', '--disable-dev-shm-usage', f'--user-data-dir={logic.profile_path}', 'https://www.facebook.com']
 
-        # --- Iniciar procesos ---
-        logic.log_to_panel(f"Iniciando VNC: {' '.join(vnc_command)}", "info")
-        vnc_proc = subprocess.Popen(vnc_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(3) # Dar más tiempo a VNC para arrancar
+        # --- Iniciar procesos con shell=True ---
+        logic.log_to_panel(f"Ejecutando VNC: {vnc_cmd_str}", "info")
+        vnc_proc = subprocess.Popen(vnc_cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(3) # Espera crucial
 
         if vnc_proc.poll() is not None:
-             stdout, stderr = vnc_proc.communicate()
-             error_msg = f"VNC Server falló al iniciar. Salida: {stdout.decode()} Error: {stderr.decode()}"
-             logic.log_to_panel(error_msg, "error"); print(error_msg)
-             return jsonify({"msg": "Error interno al iniciar el escritorio virtual."}), 500
+            stdout, stderr = vnc_proc.communicate()
+            error_msg = f"VNC Server falló. Error: {stderr.decode()}"
+            logic.log_to_panel(error_msg, "error"); print(error_msg)
+            return jsonify({"msg": "Error interno al iniciar el escritorio virtual."}), 500
 
-        logic.log_to_panel(f"VNC Server iniciado. PID: {vnc_proc.pid}", "info")
-        
-        ws_proc = subprocess.Popen(websockify_command)
+        logic.log_to_panel(f"VNC Server OK. PID: {vnc_proc.pid}", "info")
+        ws_proc = subprocess.Popen(ws_cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         active_sessions[client_id] = {'vnc': vnc_proc, 'websockify': ws_proc}
-        logic.log_to_panel(f"Websockify iniciado. PID: {ws_proc.pid}", "info")
-
-        # --- Iniciar Chrome ---
-        chrome_env = os.environ.copy()
-        chrome_env['DISPLAY'] = display_str
-        chrome_command = ['google-chrome', '--no-sandbox', '--disable-dev-shm-usage', f'--user-data-dir={logic.profile_path}', 'https://www.facebook.com']
-        subprocess.Popen(chrome_command, env=chrome_env)
+        logic.log_to_panel(f"Websockify OK. PID: {ws_proc.pid}", "info")
         
-        return jsonify({
-            "msg": "Entorno de login listo.",
-            "proxy_port": websockify_port,
-            "vnc_password": vnc_password
-        })
+        subprocess.Popen(chrome_cmd_list, env=chrome_env)
+        
+        return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
     except Exception as e:
         logic.log_to_panel(f"Excepción CRÍTICA: {e}", "error"); print(f"Excepción CRÍTICA: {e}")
         # Limpieza
         if 'vnc_proc' in locals() and vnc_proc.poll() is None: vnc_proc.terminate()
         if 'ws_proc' in locals() and ws_proc.poll() is None: ws_proc.terminate()
-        if client_id in active_sessions: del active_sessions[client_id]
-        return jsonify({"msg": "Excepción del servidor al iniciar la sesión."}), 500
-
+        return jsonify({"msg": "Excepción del servidor."}), 500
 
 def admin_required(fn):
     """Decorador para proteger rutas de admin, requiere una clave de API en la cabecera."""
