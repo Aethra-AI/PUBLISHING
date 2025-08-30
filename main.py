@@ -221,9 +221,45 @@ class AppLogic:
     
     def _find_coherent_pair_for_group(self, content_tags_str):
         """Encuentra un par de texto e imagen coherentes y disponibles para este cliente."""
-        # Lógica de búsqueda de par idéntica a la original, pero con queries adaptadas
-        # a la sintaxis de MariaDB (%s) y filtrando siempre por client_id.
-        pass
+        content_tags = [tag.strip() for tag in content_tags_str.split(',') if tag.strip()]
+        if not content_tags:
+            self.log_to_panel("No se proporcionaron etiquetas de contenido válidas.", "warning")
+            return None, None
+
+        # Construir la parte de la query para las etiquetas
+        text_tags_query_part = " OR ".join(["ai_tags LIKE %s" for _ in content_tags])
+        image_tags_query_part = " OR ".join(["manual_tags LIKE %s" for _ in content_tags])
+        
+        # Parámetros para las queries (repetidos para texto e imagen)
+        params = (self.client_id,) + tuple([f"%{tag}%" for tag in content_tags])
+
+        # Buscar el texto menos usado que coincida con las etiquetas
+        text_query = f"""
+            SELECT * FROM texts 
+            WHERE client_id = %s AND ({text_tags_query_part})
+            ORDER BY usage_count ASC, RAND() LIMIT 1
+        """
+        text = db_manager.fetch_one(text_query, params)
+
+        # Buscar la imagen menos usada que coincida con las etiquetas
+        image_query = f"""
+            SELECT i.*, COUNT(pl.id) as usage_count
+            FROM images i
+            LEFT JOIN publication_log pl ON i.id = pl.image_id AND pl.client_id = %s
+            WHERE i.client_id = %s AND ({image_tags_query_part})
+            GROUP BY i.id
+            ORDER BY usage_count ASC, RAND() LIMIT 1
+        """
+        # Los parámetros para la query de imagen necesitan el client_id dos veces
+        image_params = (self.client_id,) + params
+        image = db_manager.fetch_one(image_query, image_params)
+
+        if text and image:
+            self.log_to_panel(f"Par encontrado: Texto ID {text['id']}, Imagen ID {image['id']}", "info")
+            return text, image
+        
+        self.log_to_panel("No se pudo encontrar un par coherente de texto e imagen.", "warning")
+        return None, None
 
     def _group_publishing_process(self, group_tags, content_tags):
         """
