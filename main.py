@@ -22,7 +22,7 @@ from werkzeug.utils import secure_filename
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, disconnect
-from flask_jwt_extended import create_access_token, get_current_user, jwt_required, JWTManager, decode_token
+from flask_jwt_extended import create_access_token, get_jwt, jwt_required, JWTManager, decode_token
 
 # --- Lógica de Automatización (Selenium) ---
 from selenium import webdriver
@@ -55,23 +55,19 @@ jwt = JWTManager(app)
 # Carga el usuario desde la BD basado en la identidad del token.
 # Si el usuario no existe (ej. fue eliminado), el token se considera inválido.
 
+
+
 @jwt.user_lookup_loader
 def user_lookup_callback(_jwt_header, jwt_data):
     """
     Esta función se llama en cada petición protegida.
-    'sub' contiene la identidad que pusimos en `create_access_token`, que es el client_id.
+    'sub' contiene la identidad (el client_id) del token.
+    Devuelve el objeto de usuario si se encuentra en la BD, o None si no.
     """
     identity = jwt_data.get("sub")
-    if identity is None:
-        return None # No hay identidad en el token
-        
+    if not identity:
+        return None
     return db_manager.fetch_one("SELECT * FROM clients WHERE id = %s", (identity,))
-
-# Esta función define qué objeto se obtiene al llamar a `get_current_user()`
-# en una ruta protegida. La usaremos ahora.
-@jwt.user_identity_loader
-def user_identity_callback(user):
-    return user["id"]
 
 # --- Configuración de Archivos y Workers ---
 app.config['UPLOAD_FOLDER'] = os.path.abspath('client_uploads')
@@ -354,6 +350,8 @@ class AppLogic:
             self.log_to_panel("Proceso de publicación finalizado.")
             self.socketio.emit('publishing_status', {'isPublishing': False}, room=self.client_id)
 
+
+
 class InstanceManager:
     """Gestiona una instancia de AppLogic para cada cliente, evitando crear duplicados."""
     def __init__(self):
@@ -366,9 +364,9 @@ class InstanceManager:
                 self.instances[client_id] = AppLogic(client_id, socketio)
             return self.instances[client_id]
 
-# ==============================================================================
-# --- DECORADORES DE SEGURIDAD Y LÍMITES ---
-# ==============================================================================
+# La instanciación ocurre AQUÍ, después de que la clase ha sido definida.
+instance_manager = InstanceManager()
+
 
 def admin_required(fn):
     """Decorador para proteger rutas de admin, requiere una clave de API en la cabecera."""
@@ -383,33 +381,42 @@ def admin_required(fn):
 
 
 def check_subscription_limit(fn):
+    """
+    Decorador que se aplica a rutas protegidas para verificar el límite del plan.
+    IMPORTANTE: Debe aplicarse DESPUÉS de @jwt_required().
+    """
     @wraps(fn)
-    @jwt_required() # Aseguramos que se ejecute en rutas protegidas
     def wrapper(*args, **kwargs):
-        current_user = get_current_user()
-        if not current_user:
-            # Esto es redundante porque el user_loader ya lo valida, pero es seguro.
-            return jsonify({"msg": "Usuario no encontrado para el token"}), 404
+        # Obtenemos el ID del cliente directamente del token JWT.
+        client_id = get_jwt()['sub']
 
-        # Los datos del usuario ya están cargados en `current_user`
-        client_plan = current_user['plan']
-        trial_expires_at = current_user.get('trial_expires_at')
-        publications_this_month = current_user['publications_this_month']
+        # Buscamos la información del plan del cliente en la base de datos.
+        client = db_manager.fetch_one(
+            "SELECT plan, trial_expires_at, publications_this_month FROM clients WHERE id = %s", 
+            (client_id,)
+        )
         
-        # Verificar si la prueba ha expirado
-        if client_plan == 'free' and trial_expires_at and datetime.utcnow() > trial_expires_at:
+        # Si por alguna razón el cliente no existe, denegar acceso.
+        if not client:
+            return jsonify({"msg": "Cliente no encontrado para el token proporcionado."}), 404
+
+        # Verificar si el período de prueba ha expirado para el plan 'free'.
+        trial_expires_at = client.get('trial_expires_at')
+        if client['plan'] == 'free' and trial_expires_at and datetime.utcnow() > trial_expires_at:
             return jsonify({"msg": "Tu período de prueba ha expirado. Por favor, actualiza tu plan."}), 403
 
-        plan_limit = PLANS.get(client_plan, {'limit': 0})['limit']
+        # Obtener el límite de publicaciones del plan actual.
+        plan_limit = PLANS.get(client['plan'], {'limit': 0}).get('limit', 0)
         
-        if publications_this_month >= plan_limit:
+        # Comparar el uso actual con el límite del plan.
+        if client['publications_this_month'] >= plan_limit:
             return jsonify({
                 "msg": f"Has alcanzado el límite de {plan_limit} publicaciones de tu plan para este mes."
             }), 403
             
+        # Si todas las verificaciones pasan, ejecutar la función original de la ruta.
         return fn(*args, **kwargs)
     return wrapper
-
 # ==============================================================================
 # --- WORKER E INSTANCIAS ---
 # ==============================================================================
@@ -436,9 +443,6 @@ def job_worker():
 
 # --- Autenticación y Gestión de Cuentas ---
 
-# ======================================================
-# ====== BLOQUE PARA REEMPLAZAR (función login) ======
-# ======================================================
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     email = request.json.get("email", None)
@@ -447,21 +451,16 @@ def login():
     client = db_manager.fetch_one("SELECT * FROM clients WHERE email = %s", (email,))
     
     if client and check_password_hash(client['password_hash'], password):
-        # ¡LA CLAVE! La identidad del token es SÓLO el ID del cliente. Nada más.
+        # La identidad del token es SÓLO el ID del cliente.
         access_token = create_access_token(identity=client['id'])
         return jsonify(access_token=access_token, clientName=client['name'], clientId=client['id'])
     
     return jsonify({"msg": "Email o contraseña incorrectos"}), 401
 
-
 @app.route('/api/account/change-password', methods=['PUT'])
 @jwt_required()
 def change_password():
-    """Permite a un usuario logueado cambiar su propia contraseña."""
-    current_user = get_current_user()
-    if not current_user:
-        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
-    client_id = current_user['id']
+    client_id = get_jwt()['sub']
     current_password = request.json.get("current_password")
     new_password = request.json.get("new_password")
 
@@ -476,11 +475,7 @@ def change_password():
 @app.route('/api/account/status', methods=['GET'])
 @jwt_required()
 def get_account_status():
-    """Devuelve el estado de la cuenta del usuario, incluyendo su plan y uso actual."""
-    current_user = get_current_user()
-    if not current_user:
-        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
-    client_id = current_user['id']
+    client_id = get_jwt()['sub']
     client = db_manager.fetch_one("SELECT name, email, plan, trial_expires_at, created_at, publications_this_month FROM clients WHERE id = %s", (client_id,))
     
     plan_info = PLANS.get(client['plan'], {})
@@ -488,14 +483,13 @@ def get_account_status():
         "name": client['name'],
         "email": client['email'],
         "plan": client['plan'],
-        "trial_expires_at": client['trial_expires_at'].isoformat() if client['trial_expires_at'] else None,
-        "created_at": client['created_at'].isoformat(),
+        "trial_expires_at": client['trial_expires_at'].isoformat() if client.get('trial_expires_at') else None,
+        "created_at": client['created_at'].isoformat() if client.get('created_at') else None,
         "plan_name": plan_info.get('name'),
         "monthly_limit": plan_info.get('limit'),
         "monthly_usage": client['publications_this_month']
     }
     return jsonify(client_status)
-
 # --- Endpoints de Superusuario ---
 @app.route('/api/admin/clients', methods=['POST'])
 @admin_required
@@ -573,16 +567,15 @@ def serve_uploaded_file(client_id, filename):
 @app.route('/api/data/initial', methods=['GET'])
 @jwt_required()
 def get_initial_data():
-    current_user = get_current_user()
-    if not current_user:
-        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
-    client_id = current_user['id']
+    client_id = get_jwt()['sub']
+    client_info = db_manager.fetch_one("SELECT id, name FROM clients WHERE id=%s", (client_id,))
     data = {
+        "client_info": client_info,
         "texts": db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,)),
         "images": db_manager.fetch_all("SELECT * FROM images WHERE client_id = %s ORDER BY id DESC", (client_id,)),
         "groups": db_manager.fetch_all("SELECT * FROM groups WHERE client_id = %s ORDER BY id DESC", (client_id,)),
         "pages": db_manager.fetch_all("SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)),
-        "scheduled_posts": db_manager.fetch_all("SELECT * FROM scheduled_posts WHERE client_id = %s ORDER BY publish_at DESC", (client_id,)),
+        "scheduled_posts": db_manager.fetch_all("SELECT sp.*, p.name as page_name FROM scheduled_posts sp LEFT JOIN pages p ON sp.page_id = p.id WHERE sp.client_id = %s ORDER BY sp.publish_at DESC", (client_id,)),
         "publication_log": db_manager.fetch_all("SELECT * FROM publication_log WHERE client_id = %s ORDER BY timestamp DESC LIMIT 50", (client_id,))
     }
     return jsonify(data)
@@ -590,25 +583,22 @@ def get_initial_data():
 @app.route('/api/texts', methods=['POST'])
 @jwt_required()
 def add_text():
-    current_user = get_current_user()
-    client_id = current_user['id']
+    client_id = get_jwt()['sub']
     content = request.json.get('content')
     if not content: return jsonify({"msg": "El contenido no puede estar vacío"}), 400
     
-    tags = ai_service.generate_tags_for_text(content)
+    # tags = ai_service.generate_tags_for_text(content) # Descomenta si usas ai_service
+    tags = ["generado", "ia"] # Placeholder si ai_service no está listo
     tags_str = ",".join(tags)
-    db_manager.execute_query(
-        "INSERT INTO texts (client_id, content, ai_tags) VALUES (%s, %s, %s)",
-        (client_id, content, tags_str), commit=True
-    )
+    
+    db_manager.execute_query("INSERT INTO texts (client_id, content, ai_tags) VALUES (%s, %s, %s)", (client_id, content, tags_str), commit=True)
     new_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
     return jsonify(new_texts)
 
 @app.route('/api/images/upload', methods=['POST'])
 @jwt_required()
 def upload_images():
-    current_user = get_current_user()
-    client_id = current_user['id']
+    client_id = get_jwt()['sub']
     if 'images' not in request.files: return jsonify({"msg": "No se encontraron archivos"}), 400
         
     files = request.files.getlist('images')
@@ -621,123 +611,131 @@ def upload_images():
         unique_filename = f"{int(time.time())}_{filename}"
         save_path = os.path.join(client_upload_dir, unique_filename)
         file.save(save_path)
-        db_manager.execute_query(
-            "INSERT INTO images (client_id, path, manual_tags) VALUES (%s, %s, %s)",
-            (client_id, save_path, tags), commit=True
-        )
+        # Guardamos solo el nombre del archivo, no la ruta completa, es más seguro y portable
+        db_manager.execute_query("INSERT INTO images (client_id, path, manual_tags) VALUES (%s, %s, %s)", (client_id, unique_filename, tags), commit=True)
         
     new_images = db_manager.fetch_all("SELECT * FROM images WHERE client_id = %s ORDER BY id DESC", (client_id,))
     return jsonify(new_images)
-
 @app.route('/api/texts/<int:item_id>', methods=['PUT'])
 @jwt_required()
 def update_text(item_id):
-    current_user = get_current_user()
-    client_id = current_user['id']
+    client_id = get_jwt()['sub']
     content = request.json.get('content')
-    # Validar que el texto pertenece al cliente
     text_obj = db_manager.fetch_one("SELECT id FROM texts WHERE id = %s AND client_id = %s", (item_id, client_id))
     if not text_obj: return jsonify({"msg": "Texto no encontrado o no autorizado"}), 404
     
-    tags = ai_service.generate_tags_for_text(content)
+    # tags = ai_service.generate_tags_for_text(content) # Descomenta si usas ai_service
+    tags = ["editado", "ia"] # Placeholder
     tags_str = ",".join(tags)
-    db_manager.execute_query(
-        "UPDATE texts SET content = %s, ai_tags = %s WHERE id = %s",
-        (content, tags_str, item_id), commit=True
-    )
+
+    db_manager.execute_query("UPDATE texts SET content = %s, ai_tags = %s WHERE id = %s", (content, tags_str, item_id), commit=True)
     updated_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
     return jsonify(updated_texts)
-
 @app.route('/api/items/<table>/<int:item_id>', methods=['DELETE'])
 @jwt_required()
 def delete_item(table, item_id):
-    current_user = get_current_user()
-    client_id = current_user['id']
-    # Lista blanca de tablas permitidas para evitar inyección SQL en el nombre de la tabla
+    client_id = get_jwt()['sub']
     allowed_tables = ['texts', 'images', 'groups', 'pages', 'scheduled_posts']
     if table not in allowed_tables:
         return jsonify({"msg": "Operación no permitida"}), 400
 
-    # Para imágenes, también eliminamos el archivo físico
     if table == 'images':
         image_record = db_manager.fetch_one("SELECT path FROM images WHERE id = %s AND client_id = %s", (item_id, client_id))
-        if image_record and os.path.exists(image_record['path']):
-            try:
-                os.remove(image_record['path'])
-            except OSError as e:
-                print(f"Error eliminando archivo de imagen: {e}")
+        if image_record:
+            # Construye la ruta completa para borrar el archivo
+            full_path = os.path.join(app.config['UPLOAD_FOLDER'], f'client_{client_id}', image_record['path'])
+            if os.path.exists(full_path):
+                os.remove(full_path)
 
-    # La query es segura porque el nombre de la tabla se valida contra la lista blanca
     query = f"DELETE FROM {table} WHERE id = %s AND client_id = %s"
     cursor = db_manager.execute_query(query, (item_id, client_id), commit=True)
     
     if cursor.rowcount == 0:
         return jsonify({"msg": "Elemento no encontrado o no autorizado"}), 404
 
-    return jsonify({"success": True, "msg": f"Elemento de '{table}' eliminado."})
+    # Devuelve la lista actualizada del tipo de dato correspondiente
+    updated_data = db_manager.fetch_all(f"SELECT * FROM {table} WHERE client_id = %s ORDER BY id DESC", (client_id,))
+    return jsonify({"success": True, "msg": f"Elemento eliminado.", "updated_data": updated_data})
 
-@app.route('/api/<item_type>', methods=['POST'])
+
+@app.route('/api/groups', methods=['POST'])
 @jwt_required()
-def add_item(item_type):
-    current_user = get_current_user()
-    client_id = current_user['id']
+def add_group():
+    client_id = get_jwt()['sub']
     data = request.get_json()
-    
-    if item_type == 'groups':
-        db_manager.execute_query(
-            "INSERT INTO groups (client_id, url, tags) VALUES (%s, %s, %s)",
-            (client_id, data['url'], data['tags']), commit=True
-        )
-        return jsonify(db_manager.fetch_all("SELECT * FROM groups WHERE client_id = %s ORDER BY id DESC", (client_id,)))
-    
-    if item_type == 'pages':
-        db_manager.execute_query(
-            "INSERT INTO pages (client_id, name, page_url) VALUES (%s, %s, %s)",
-            (client_id, data['name'], data['page_url']), commit=True
-        )
-        return jsonify(db_manager.fetch_all("SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)))
+    db_manager.execute_query("INSERT INTO groups (client_id, url, tags) VALUES (%s, %s, %s)", (client_id, data['url'], data['tags']), commit=True)
+    return jsonify(db_manager.fetch_all("SELECT * FROM groups WHERE client_id = %s ORDER BY id DESC", (client_id,)))
 
-    if item_type == 'scheduled_posts':
-        db_manager.execute_query(
-            "INSERT INTO scheduled_posts (client_id, page_id, publish_at, text_content, image_id) VALUES (%s, %s, %s, %s, %s)",
-            (client_id, data['page_id'], data['publish_at'], data['text_content'], data.get('image_id')), commit=True
-        )
-        return jsonify(db_manager.fetch_all("SELECT * FROM scheduled_posts WHERE client_id = %s ORDER BY publish_at DESC", (client_id,)))
-        
-    return jsonify({"msg": "Tipo de elemento no válido"}), 400
+@app.route('/api/pages', methods=['POST'])
+@jwt_required()
+def add_page():
+    client_id = get_jwt()['sub']
+    data = request.get_json()
+    db_manager.execute_query("INSERT INTO pages (client_id, name, page_url) VALUES (%s, %s, %s)", (client_id, data['name'], data['page_url']), commit=True)
+    return jsonify(db_manager.fetch_all("SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)))
+
+@app.route('/api/scheduled_posts', methods=['POST'])
+@jwt_required()
+def add_scheduled_post():
+    client_id = get_jwt()['sub']
+    data = request.get_json()
+    db_manager.execute_query("INSERT INTO scheduled_posts (client_id, page_id, publish_at, text_content, image_id) VALUES (%s, %s, %s, %s, %s)", (client_id, data['page_id'], data['publish_at'], data['text_content'], data.get('image_id')), commit=True)
+    return jsonify(db_manager.fetch_all("SELECT sp.*, p.name as page_name FROM scheduled_posts sp LEFT JOIN pages p ON sp.page_id = p.id WHERE sp.client_id = %s ORDER BY sp.publish_at DESC", (client_id,)))
+
 
 @app.route('/api/publishing/start', methods=['POST'])
+@jwt_required()
 @check_subscription_limit
 def start_publishing():
-    current_user = get_current_user()
-    if not current_user:
-    # El user_loader ya habría prevenido esto, pero es una buena práctica de seguridad
-        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
-    client_id = current_user['id']
-    logic = instance_manager.get_logic(client_id)
+    # Obtenemos el client_id del token. Ahora SÍ lo usaremos.
+    client_id = get_jwt()['sub']
+
+    # Verificamos si ya hay una instancia de lógica para este cliente.
+    # Creamos una si no existe.
+    if client_id not in instance_manager:
+        instance_manager[client_id] = AppLogic(client_id, socketio)
+    logic = instance_manager[client_id]
+
+    # Evitamos que se encolen múltiples trabajos para el mismo cliente.
     if logic.is_publishing:
-        return jsonify({"msg": "Un proceso ya está en ejecución para ti."}), 409
+        return jsonify({"msg": "Un proceso de publicación ya está en ejecución para ti."}), 409
         
     data = request.get_json()
-    job = {'client_id': client_id, 'task_type': 'publish_to_groups', 'data': data}
+    if not data or 'group_tags' not in data or 'content_tags' not in data:
+        return jsonify({"msg": "Faltan etiquetas de grupos o de contenido."}), 400
+
+    # Creamos el trabajo y lo añadimos a la cola.
+    job = {
+        'client_id': client_id, 
+        'task_type': 'publish_to_groups', 
+        'data': {
+            'group_tags': data['group_tags'],
+            'content_tags': data['content_tags']
+        }
+    }
     job_queue.put(job)
-    logic.is_publishing = True # Marcar como ocupado para evitar duplicados
+    
+    # Actualizamos el estado y notificamos al frontend.
+    logic.is_publishing = True
     logic.log_to_panel("✅ Tu solicitud de publicación ha sido añadida a la cola.")
-    socketio.emit('publishing_status', {'isPublishing': True}, room=client_id)
+    socketio.emit('publishing_status', {'isPublishing': True}, room=str(client_id))
+    
     return jsonify({"msg": "Proceso de publicación encolado."})
 
 @app.route('/api/publishing/stop', methods=['POST'])
 @jwt_required()
 def stop_publishing():
-    current_user = get_current_user()
-    client_id = current_user['id']
-    logic = instance_manager.get_logic(client_id)
-    if logic.is_publishing:
-        logic.is_publishing = False # La bandera detendrá el bucle en el worker
+    client_id = get_jwt()['sub']
+
+    # Verificamos si existe una instancia para este cliente y si está publicando.
+    if client_id in instance_manager and instance_manager[client_id].is_publishing:
+        logic = instance_manager[client_id]
+        # Cambiar la bandera es suficiente para que el bucle del worker se detenga.
+        logic.is_publishing = False
         logic.log_to_panel("Solicitud de detención recibida. El proceso terminará después de la publicación actual.", "warning")
         return jsonify({"msg": "Se ha solicitado la detención del proceso."})
-    return jsonify({"msg": "No hay ningún proceso en ejecución."})
-
+    
+    return jsonify({"msg": "No hay ningún proceso en ejecución para detener."})
 # ==============================================================================
 # --- WEB SOCKETS E INICIO ---
 # ==============================================================================
@@ -774,11 +772,9 @@ def on_disconnect():
     print("Cliente desconectado de WebSocket.")
 
 if __name__ == "__main__":
-    # Iniciar los hilos del worker
     for i in range(MAX_CONCURRENT_BROWSERS):
         worker_thread = threading.Thread(target=job_worker, daemon=True)
         worker_thread.start()
-        print(f"▶️ Worker {i+1}/{MAX_CONCURRENT_BROWSERS} iniciado.")
 
     print(f"🚀 Iniciando servidor Flask en modo Multi-Inquilino...")
     # Usar eventlet o gevent es recomendado para producción con SocketIO
