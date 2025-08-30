@@ -723,12 +723,11 @@ def update_text(item_id):
 
 
 
+
+
 @app.route('/api/texts/generate-ai', methods=['POST'])
 @jwt_required()
 def generate_ai_texts():
-    """
-    Genera textos usando IA, los guarda en la base de datos y devuelve la lista completa.
-    """
     client_id_raw = get_jwt().get('sub')
     try:
         client_id = int(client_id_raw)
@@ -743,18 +742,27 @@ def generate_ai_texts():
         return jsonify({"msg": "Se requiere un tema para la generación."}), 400
 
     try:
-        # 1. Llamar al servicio de IA para generar los textos (NOMBRE DE FUNCIÓN CORREGIDO)
-        print(f"Generando {count} textos para el cliente {client_id} sobre el tema: '{topic}'")
-        generated_texts = ai_service.generate_text_variations(topic, count) # <-- ¡ESTA ES LA LÍNEA CORREGIDA!
+        print(f"INFO: [Cliente {client_id}] Iniciando generación de {count} textos sobre '{topic}'.")
         
-        # 2. Guardar cada texto generado en la base de datos
+        generated_texts = ai_service.generate_text_variations(topic, count)
+        
+        # Log para ver qué nos devuelve la IA
+        print(f"INFO: [Cliente {client_id}] OpenAI devolvió {len(generated_texts)} textos.")
+        # print(f"DEBUG: Textos recibidos: {generated_texts}") # Descomenta para ver el contenido exacto
+
+        if not generated_texts:
+            print(f"WARN: [Cliente {client_id}] OpenAI no devolvió textos. Terminando la operación sin cambios.")
+            # Devolvemos la lista actual para que el frontend no se rompa
+            current_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
+            return jsonify(current_texts)
+            
+        print(f"INFO: [Cliente {client_id}] Guardando {len(generated_texts)} textos en la base de datos.")
         for text_content in generated_texts:
-            # Intentar generar etiquetas para cada texto individualmente
             try:
                 tags = ai_service.generate_tags_for_text(text_content)
                 tags_str = ",".join(tags) if tags else ""
             except Exception as e_tags:
-                print(f"ADVERTENCIA: Falló la generación de etiquetas por IA para un texto: {e_tags}")
+                print(f"WARN: Falló la generación de etiquetas para un texto: {e_tags}")
                 tags_str = ""
             
             db_manager.execute_query(
@@ -763,14 +771,15 @@ def generate_ai_texts():
                 commit=True
             )
         
-        # 3. Devolver la lista actualizada de todos los textos del cliente
+        print(f"INFO: [Cliente {client_id}] Textos guardados exitosamente. Devolviendo lista actualizada.")
         new_texts = db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,))
         return jsonify(new_texts)
 
     except Exception as e:
-        print(f"ERROR: Falló la generación de textos con IA: {e}")
+        # Este log es crucial para ver si hay un error inesperado
+        print(f"ERROR: Excepción CRÍTICA en generate_ai_texts: {e}")
         return jsonify({"msg": f"Error al generar textos: {str(e)}"}), 500
-
+    
 
 @app.route('/api/items/<table>/<int:item_id>', methods=['DELETE'])
 @jwt_required()
