@@ -435,6 +435,10 @@ def cleanup_all_sessions():
 atexit.register(cleanup_all_sessions)
 
 
+# En main.py
+
+# ... (deja el diccionario active_sessions y la función cleanup_all_sessions como estaban) ...
+
 @app.route('/api/publishing/init-login', methods=['POST'])
 @jwt_required()
 def init_facebook_login():
@@ -444,8 +448,10 @@ def init_facebook_login():
     
     # Limpieza de sesión anterior
     if client_id in active_sessions:
-        for proc in active_sessions.pop(client_id, {}).values():
-            if proc and proc.poll() is None: proc.terminate()
+        # systemd-run crea unidades transitorias, necesitamos encontrarlas y detenerlas
+        scope_name = active_sessions.pop(client_id, {}).get('scope')
+        if scope_name:
+            subprocess.run(['systemctl', '--user', 'stop', scope_name])
         logic.log_to_panel("Cerrando sesión anterior.", "info")
 
     vnc_display = random.randint(1, 100); display_str = f":{vnc_display}"
@@ -453,43 +459,58 @@ def init_facebook_login():
     ws_port = random.randint(6001, 7000)
     vnc_password = secrets.token_hex(8)
     
-    # Crear archivo de contraseña
     pass_file = f'/tmp/vnc_pass_{client_id}'; open(pass_file, 'w').write(vnc_password); os.chmod(pass_file, 0o600)
 
     try:
-        # --- Comandos como strings para shell=True ---
-        vnc_cmd_str = f"/usr/bin/tigervncserver {display_str} -localhost -fg -geometry 1280x800 -depth 24 -passwd {pass_file} -xstartup /usr/bin/startxfce4"
+        # --- Comando VNC con systemd-run ---
+        # --user: Ejecuta como un servicio de usuario para agencia_henmir
+        # --scope: Crea una unidad transitoria que se limpia sola
+        # --collect: Espera a que el proceso termine
+        # -p "Delegate=yes": Permite que el servicio gestione sus propios subprocesos
+        # Esto le da a VNC un entorno de sesión de usuario completo y adecuado.
+        vnc_command = [
+            'systemd-run',
+            '--user',
+            '--scope',
+            '-p', 'Delegate=yes',
+            '--collect',
+            f'--unit=vnc-session-{client_id}',
+            '/usr/bin/tigervncserver',
+            display_str,
+            '-localhost', '-fg', '-geometry', '1280x800', '-depth', '24',
+            '-passwd', pass_file,
+            '-xstartup', '/usr/bin/startxfce4'
+        ]
+        
         ws_cmd_str = f"/usr/bin/websockify {ws_port} localhost:{vnc_tcp_port}"
         
-        # Entorno para Chrome
-        chrome_env = os.environ.copy(); chrome_env['DISPLAY'] = display_str
-        chrome_cmd_list = ['google-chrome', '--no-sandbox', '--disable-dev-shm-usage', f'--user-data-dir={logic.profile_path}', 'https://www.facebook.com']
+        logic.log_to_panel(f"Ejecutando VNC con systemd-run...", "info")
+        # Usamos Popen para no bloquear la aplicación, pero systemd-run gestionará el proceso
+        vnc_proc = subprocess.Popen(vnc_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(4) # Dar a systemd-run y a VNC tiempo para arrancar
 
-        # --- Iniciar procesos con shell=True ---
-        logic.log_to_panel(f"Ejecutando VNC: {vnc_cmd_str}", "info")
-        vnc_proc = subprocess.Popen(vnc_cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(3) # Espera crucial
-
+        # Revisar si el proceso de systemd-run falló inmediatamente
         if vnc_proc.poll() is not None:
-            stdout, stderr = vnc_proc.communicate()
-            error_msg = f"VNC Server falló. Error: {stderr.decode()}"
-            logic.log_to_panel(error_msg, "error"); print(error_msg)
-            return jsonify({"msg": "Error interno al iniciar el escritorio virtual."}), 500
+             stdout, stderr = vnc_proc.communicate()
+             error_msg = f"systemd-run para VNC falló. Error: {stderr.decode()}"
+             logic.log_to_panel(error_msg, "error"); print(error_msg)
+             return jsonify({"msg": "Error interno al iniciar el escritorio virtual."}), 500
 
-        logic.log_to_panel(f"VNC Server OK. PID: {vnc_proc.pid}", "info")
-        ws_proc = subprocess.Popen(ws_cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        active_sessions[client_id] = {'vnc': vnc_proc, 'websockify': ws_proc}
-        logic.log_to_panel(f"Websockify OK. PID: {ws_proc.pid}", "info")
+        # Si llegamos aquí, systemd-run ha lanzado VNC con éxito
+        logic.log_to_panel(f"VNC Server lanzado vía systemd. Iniciando proxy y Chrome.", "info")
+        ws_proc = subprocess.Popen(ws_cmd_str, shell=True)
         
+        # Guardamos el nombre de la unidad para poder detenerla más tarde
+        active_sessions[client_id] = {'scope': f'vnc-session-{client_id}.scope', 'websockify': ws_proc}
+        
+        chrome_env = os.environ.copy(); chrome_env['DISPLAY'] = display_str
+        chrome_cmd_list = ['google-chrome', '--no-sandbox', f'--user-data-dir={logic.profile_path}', 'https://www.facebook.com']
         subprocess.Popen(chrome_cmd_list, env=chrome_env)
         
         return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
     except Exception as e:
         logic.log_to_panel(f"Excepción CRÍTICA: {e}", "error"); print(f"Excepción CRÍTICA: {e}")
-        # Limpieza
-        if 'vnc_proc' in locals() and vnc_proc.poll() is None: vnc_proc.terminate()
-        if 'ws_proc' in locals() and ws_proc.poll() is None: ws_proc.terminate()
         return jsonify({"msg": "Excepción del servidor."}), 500
 
 def admin_required(fn):
