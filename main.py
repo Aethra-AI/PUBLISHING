@@ -8,7 +8,8 @@ import shutil
 from datetime import datetime, timedelta, date
 from queue import Queue
 from functools import wraps
-
+import traceback
+# ... otras importaciones
 # main.py
 import subprocess
 import secrets
@@ -478,9 +479,17 @@ def init_facebook_login():
         return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
     except Exception as e:
-        logic.log_to_panel(f"Excepción CRÍTICA: {e}", "error"); print(f"Excepción CRÍTICA: {e}")
-        return jsonify({"msg": "Excepción del servidor."}), 500
+    # --- Bloque de depuración mejorado ---
+        tb_str = traceback.format_exc()
+        error_log_message = f"Excepción CRÍTICA en init_facebook_login:\n--- TRACEBACK ---\n{tb_str}\n--- FIN TRACEBACK ---"
     
+        # Imprimir en los logs de systemd
+        print(error_log_message)
+    
+    # Enviar a la consola del usuario
+        logic.log_to_panel("Ocurrió un error crítico en el servidor. Revisa los logs.", "error")
+    
+        return jsonify({"msg": "Excepción del servidor."}), 500
     
 def admin_required(fn):
     """Decorador para proteger rutas de admin, requiere una clave de API en la cabecera."""
