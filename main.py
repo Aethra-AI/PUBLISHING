@@ -1044,61 +1044,6 @@ def stop_publishing():
     return jsonify({"msg": "No hay ningún proceso en ejecución para detener."})
 
 
-# En main.py, añádelo después de la función stop_publishing
-
-@app.route('/api/publishing/init-login', methods=['POST'])
-@jwt_required()
-def init_facebook_login():
-    """
-    Inicia una instancia de navegador NO-headless para que el usuario pueda
-    iniciar sesión manualmente en Facebook.
-    Esta función es intencionalmente síncrona y de larga duración.
-    """
-    client_id_raw = get_jwt().get('sub')
-    try:
-        client_id = int(client_id_raw)
-    except (TypeError, ValueError):
-        return jsonify({"msg": "Token inválido."}), 401
-    
-    logic = instance_manager.get_logic(client_id)
-
-    # Evita iniciar un nuevo login si ya hay un proceso en marcha
-    if logic.is_publishing:
-        return jsonify({"msg": "No se puede iniciar sesión mientras un proceso de publicación está activo."}), 409
-
-    # Cierra cualquier navegador anterior que pudiera haber quedado abierto
-    logic.close_browser()
-
-    logic.log_to_panel("Iniciando navegador para el login manual en Facebook...", "info")
-    
-    # Inicia el navegador en modo NO-headless (visible en el servidor)
-    if not logic.init_browser(headless=False):
-        logic.log_to_panel("Error crítico: No se pudo iniciar el navegador en el servidor.", "error")
-        return jsonify({"msg": "No se pudo iniciar el navegador en el servidor."}), 500
-
-    try:
-        logic.driver.get("https://www.facebook.com")
-        logic.log_to_panel("Navegador abierto en Facebook. Por favor, inicie sesión.", "success")
-        logic.log_to_panel("La ventana del navegador en el servidor se cerrará automáticamente después de 5 minutos o cuando cierre esta sesión.", "warning")
-        
-        # Espera hasta 5 minutos (300 segundos) para que el usuario inicie sesión.
-        # Después de este tiempo, el navegador se cerrará para liberar recursos.
-        # WebDriverWait espera una condición que nunca se cumplirá, efectivamente pausando la ejecución.
-        WebDriverWait(logic.driver, 300).until(lambda d: False)
-
-    except TimeoutException:
-        # Esto es lo esperado, que el tiempo de espera se agote.
-        logic.log_to_panel("Tiempo de sesión de login finalizado. El perfil debería haberse guardado.", "info")
-    except WebDriverException as e:
-        # Esto ocurre si el usuario cierra el navegador manualmente.
-        logic.log_to_panel(f"Navegador cerrado o desconectado: {e}", "info")
-    finally:
-        # Asegúrate de que el navegador se cierre siempre
-        logic.close_browser()
-        logic.log_to_panel("Sesión de login finalizada.", "info")
-
-    return jsonify({"msg": "Proceso de login finalizado."})
-
 
 # ==============================================================================
 # --- WEB SOCKETS E INICIO ---
