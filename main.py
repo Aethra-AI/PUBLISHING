@@ -67,6 +67,10 @@ def user_lookup_callback(_jwt_header, jwt_data):
     identity = jwt_data.get("sub")
     if not identity:
         return None
+    try:
+        identity = int(identity)
+    except (TypeError, ValueError):
+        return None
     return db_manager.fetch_one("SELECT * FROM clients WHERE id = %s", (identity,))
 
 # --- Configuración de Archivos y Workers ---
@@ -451,8 +455,8 @@ def login():
     client = db_manager.fetch_one("SELECT * FROM clients WHERE email = %s", (email,))
     
     if client and check_password_hash(client['password_hash'], password):
-        # La identidad del token es SÓLO el ID del cliente.
-        access_token = create_access_token(identity=client['id'])
+        # La identidad del token (sub) debe ser STRING para cumplir con JWT (RFC 7519)
+        access_token = create_access_token(identity=str(client['id']))
         return jsonify(access_token=access_token, clientName=client['name'], clientId=client['id'])
     
     return jsonify({"msg": "Email o contraseña incorrectos"}), 401
@@ -578,7 +582,11 @@ def get_initial_data():
     cargue su panel de control.
     """
     # 1. Obtiene el ID del cliente de forma segura desde el token JWT validado.
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
     
     # 2. Obtiene la información básica del cliente.
     client_info = db_manager.fetch_one("SELECT id, name FROM clients WHERE id=%s", (client_id,))
@@ -613,7 +621,11 @@ def get_initial_data():
 @app.route('/api/texts', methods=['POST'])
 @jwt_required()
 def add_text():
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
     content = request.json.get('content')
     if not content: return jsonify({"msg": "El contenido no puede estar vacío"}), 400
     
@@ -628,7 +640,11 @@ def add_text():
 @app.route('/api/images/upload', methods=['POST'])
 @jwt_required()
 def upload_images():
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
     if 'images' not in request.files: return jsonify({"msg": "No se encontraron archivos"}), 400
         
     files = request.files.getlist('images')
@@ -649,7 +665,11 @@ def upload_images():
 @app.route('/api/texts/<int:item_id>', methods=['PUT'])
 @jwt_required()
 def update_text(item_id):
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
     content = request.json.get('content')
     text_obj = db_manager.fetch_one("SELECT id FROM texts WHERE id = %s AND client_id = %s", (item_id, client_id))
     if not text_obj: return jsonify({"msg": "Texto no encontrado o no autorizado"}), 404
@@ -664,7 +684,11 @@ def update_text(item_id):
 @app.route('/api/items/<table>/<int:item_id>', methods=['DELETE'])
 @jwt_required()
 def delete_item(table, item_id):
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
     allowed_tables = ['texts', 'images', 'groups', 'pages', 'scheduled_posts']
     if table not in allowed_tables:
         return jsonify({"msg": "Operación no permitida"}), 400
@@ -699,7 +723,11 @@ def add_group():
 @app.route('/api/pages', methods=['POST'])
 @jwt_required()
 def add_page():
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
     data = request.get_json()
     db_manager.execute_query("INSERT INTO pages (client_id, name, page_url) VALUES (%s, %s, %s)", (client_id, data['name'], data['page_url']), commit=True)
     return jsonify(db_manager.fetch_all("SELECT * FROM pages WHERE client_id = %s ORDER BY id DESC", (client_id,)))
@@ -707,7 +735,11 @@ def add_page():
 @app.route('/api/scheduled_posts', methods=['POST'])
 @jwt_required()
 def add_scheduled_post():
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
     data = request.get_json()
     db_manager.execute_query("INSERT INTO scheduled_posts (client_id, page_id, publish_at, text_content, image_id) VALUES (%s, %s, %s, %s, %s)", (client_id, data['page_id'], data['publish_at'], data['text_content'], data.get('image_id')), commit=True)
     return jsonify(db_manager.fetch_all("SELECT sp.*, p.name as page_name FROM scheduled_posts sp LEFT JOIN pages p ON sp.page_id = p.id WHERE sp.client_id = %s ORDER BY sp.publish_at DESC", (client_id,)))
@@ -718,7 +750,11 @@ def add_scheduled_post():
 @check_subscription_limit
 def start_publishing():
     # Obtenemos el client_id del token. Ahora SÍ lo usaremos.
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
 
     # Verificamos si ya hay una instancia de lógica para este cliente.
     # Creamos una si no existe.
@@ -755,7 +791,11 @@ def start_publishing():
 @app.route('/api/publishing/stop', methods=['POST'])
 @jwt_required()
 def stop_publishing():
-    client_id = get_jwt()['sub']
+    client_id_raw = get_jwt().get('sub')
+    try:
+        client_id = int(client_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({"msg": "Token inválido."}), 401
 
     # Verificamos si existe una instancia para este cliente y si está publicando.
     if client_id in instance_manager and instance_manager[client_id].is_publishing:
