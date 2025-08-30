@@ -22,7 +22,7 @@ from werkzeug.utils import secure_filename
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, disconnect
-from flask_jwt_extended import create_access_token, get_jwt, jwt_required, JWTManager, decode_token
+from flask_jwt_extended import create_access_token, get_current_user, jwt_required, JWTManager, decode_token
 
 # --- Lógica de Automatización (Selenium) ---
 from selenium import webdriver
@@ -51,6 +51,19 @@ SUPERUSER_API_KEY = os.getenv("SUPERUSER_API_KEY")
 if not SUPERUSER_API_KEY:
     raise ValueError("SUPERUSER_API_KEY no está definida en el archivo .env")
 jwt = JWTManager(app)
+# Esta función se ejecuta cada vez que se accede a una ruta protegida.
+# Carga el usuario desde la BD basado en la identidad del token.
+# Si el usuario no existe (ej. fue eliminado), el token se considera inválido.
+@jwt.user_lookup_loader
+def user_lookup_callback(_jwt_header, jwt_data):
+    identity = jwt_data["sub"]
+    return db_manager.fetch_one("SELECT id, name, plan FROM clients WHERE id = %s", (identity,))
+
+# Esta función define qué objeto se obtiene al llamar a `get_current_user()`
+# en una ruta protegida. La usaremos ahora.
+@jwt.user_identity_loader
+def user_identity_callback(user):
+    return user["id"]
 
 # --- Configuración de Archivos y Workers ---
 app.config['UPLOAD_FOLDER'] = os.path.abspath('client_uploads')
@@ -420,7 +433,7 @@ def login():
     client = db_manager.fetch_one("SELECT id, name, password_hash FROM clients WHERE email = %s", (email,))
     
     if client and check_password_hash(client['password_hash'], password):
-        access_token = create_access_token(identity=int(client['id']))
+        access_token = create_access_token(identity=client)
         return jsonify(access_token=access_token, clientName=client['name'], clientId=client['id'])
     
     return jsonify({"msg": "Email o contraseña incorrectos"}), 401
@@ -429,7 +442,10 @@ def login():
 @jwt_required()
 def change_password():
     """Permite a un usuario logueado cambiar su propia contraseña."""
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
+    client_id = current_user['id']
     current_password = request.json.get("current_password")
     new_password = request.json.get("new_password")
 
@@ -445,7 +461,10 @@ def change_password():
 @jwt_required()
 def get_account_status():
     """Devuelve el estado de la cuenta del usuario, incluyendo su plan y uso actual."""
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
+    client_id = current_user['id']
     client = db_manager.fetch_one("SELECT name, email, plan, trial_expires_at, created_at, publications_this_month FROM clients WHERE id = %s", (client_id,))
     
     plan_info = PLANS.get(client['plan'], {})
@@ -538,7 +557,10 @@ def serve_uploaded_file(client_id, filename):
 @app.route('/api/data/initial', methods=['GET'])
 @jwt_required()
 def get_initial_data():
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
+    client_id = current_user['id']
     data = {
         "texts": db_manager.fetch_all("SELECT * FROM texts WHERE client_id = %s ORDER BY id DESC", (client_id,)),
         "images": db_manager.fetch_all("SELECT * FROM images WHERE client_id = %s ORDER BY id DESC", (client_id,)),
@@ -552,7 +574,8 @@ def get_initial_data():
 @app.route('/api/texts', methods=['POST'])
 @jwt_required()
 def add_text():
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    client_id = current_user['id']
     content = request.json.get('content')
     if not content: return jsonify({"msg": "El contenido no puede estar vacío"}), 400
     
@@ -568,7 +591,8 @@ def add_text():
 @app.route('/api/images/upload', methods=['POST'])
 @jwt_required()
 def upload_images():
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    client_id = current_user['id']
     if 'images' not in request.files: return jsonify({"msg": "No se encontraron archivos"}), 400
         
     files = request.files.getlist('images')
@@ -592,7 +616,8 @@ def upload_images():
 @app.route('/api/texts/<int:item_id>', methods=['PUT'])
 @jwt_required()
 def update_text(item_id):
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    client_id = current_user['id']
     content = request.json.get('content')
     # Validar que el texto pertenece al cliente
     text_obj = db_manager.fetch_one("SELECT id FROM texts WHERE id = %s AND client_id = %s", (item_id, client_id))
@@ -610,7 +635,8 @@ def update_text(item_id):
 @app.route('/api/items/<table>/<int:item_id>', methods=['DELETE'])
 @jwt_required()
 def delete_item(table, item_id):
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    client_id = current_user['id']
     # Lista blanca de tablas permitidas para evitar inyección SQL en el nombre de la tabla
     allowed_tables = ['texts', 'images', 'groups', 'pages', 'scheduled_posts']
     if table not in allowed_tables:
@@ -637,7 +663,8 @@ def delete_item(table, item_id):
 @app.route('/api/<item_type>', methods=['POST'])
 @jwt_required()
 def add_item(item_type):
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    client_id = current_user['id']
     data = request.get_json()
     
     if item_type == 'groups':
@@ -667,7 +694,11 @@ def add_item(item_type):
 @jwt_required()
 @check_subscription_limit
 def start_publishing():
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    if not current_user:
+    # El user_loader ya habría prevenido esto, pero es una buena práctica de seguridad
+        return jsonify({"msg": "Token inválido o usuario no encontrado"}), 401
+    client_id = current_user['id']
     logic = instance_manager.get_logic(client_id)
     if logic.is_publishing:
         return jsonify({"msg": "Un proceso ya está en ejecución para ti."}), 409
@@ -683,7 +714,8 @@ def start_publishing():
 @app.route('/api/publishing/stop', methods=['POST'])
 @jwt_required()
 def stop_publishing():
-    client_id = get_jwt()['sub']
+    current_user = get_current_user()
+    client_id = current_user['id']
     logic = instance_manager.get_logic(client_id)
     if logic.is_publishing:
         logic.is_publishing = False # La bandera detendrá el bucle en el worker
