@@ -436,51 +436,42 @@ def cleanup_all_sessions():
 atexit.register(cleanup_all_sessions)
 
 
-# En main.py
-
 @app.route('/api/publishing/init-login', methods=['POST'])
 @jwt_required()
 def init_facebook_login():
     try:
         client_id = int(get_jwt().get('sub'))
-        logic = instance_manager.get_logic(client_id)
-        if logic.is_publishing: return jsonify({"msg": "Publicación en curso."}), 409
+        if client_id in active_sessions:
+            ws_proc = active_sessions.pop(client_id, {}).get('websockify')
+            if ws_proc and ws_proc.poll() is None: ws_proc.terminate()
         
-        # --- Nueva Lógica: Delegar al Launcher ---
-        request_file = "/tmp/vnc_request.tmp"
-        with open(request_file, 'w') as f:
-            f.write(str(client_id))
-        
-        logic.log_to_panel("Solicitud de sesión VNC enviada al launcher.", "info")
-        
-        # --- La lógica restante es la misma ---
         vnc_tcp_port = 5900 + client_id
         ws_port = random.randint(6001, 7000)
         vnc_password = secrets.token_hex(8)
         
-        # El launcher iniciará VNC, que leerá este archivo
-        pass_file = f'/tmp/vnc_pass_{client_id}'; open(pass_file, 'w').write(vnc_password); os.chmod(pass_file, 0o600)
+        open(f'/tmp/vnc_pass_{client_id}', 'w').write(vnc_password); os.chmod(f'/tmp/vnc_pass_{client_id}', 0o600)
+
+        service_name = f'vnc-session@{client_id}.service'
+        subprocess.run(['sudo', '/bin/systemctl', 'stop', service_name])
+        result = subprocess.run(['sudo', '/bin/systemctl', 'start', service_name], capture_output=True, text=True, timeout=10)
         
-        # Esperar a que el servicio VNC se inicie
-        time.sleep(5) 
+        if result.returncode != 0:
+            error_msg = f"Fallo al iniciar VNC. Stderr: {result.stderr}"
+            print(f"--- ERROR: {error_msg}")
+            return jsonify({"msg": "Error interno al iniciar VNC."}), 500
         
         ws_cmd_str = f"/usr/bin/websockify {ws_port} localhost:{vnc_tcp_port}"
         ws_proc = subprocess.Popen(ws_cmd_str, shell=True)
         active_sessions[client_id] = {'websockify': ws_proc}
         
-        chrome_env = os.environ.copy(); chrome_env['DISPLAY'] = f":{client_id}"
-        chrome_cmd_list = ['google-chrome', '--no-sandbox', '--disable-dev-shm-usage', f'--user-data-dir={logic.profile_path}', 'https://www.facebook.com']
-        subprocess.Popen(chrome_cmd_list, env=chrome_env)
-        
         return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
     except Exception:
         tb_str = traceback.format_exc()
-        error_log_message = f"Excepción CRÍTICA en init_facebook_login:\n--- TRACEBACK ---\n{tb_str}\n--- FIN TRACEBACK ---"
-        print(error_log_message)
-        if 'logic' in locals():
-            logic.log_to_panel("Ocurrió un error crítico en el servidor.", "error")
+        print(f"Excepción CRÍTICA en init_facebook_login:\n{tb_str}")
         return jsonify({"msg": "Excepción del servidor."}), 500
+    
+    
 def admin_required(fn):
     """Decorador para proteger rutas de admin, requiere una clave de API en la cabecera."""
     @wraps(fn)
