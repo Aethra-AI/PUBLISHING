@@ -436,6 +436,8 @@ def cleanup_all_sessions():
 atexit.register(cleanup_all_sessions)
 
 
+# En main.py
+
 @app.route('/api/publishing/init-login', methods=['POST'])
 @jwt_required()
 def init_facebook_login():
@@ -444,40 +446,29 @@ def init_facebook_login():
         logic = instance_manager.get_logic(client_id)
         if logic.is_publishing: return jsonify({"msg": "Publicación en curso."}), 409
         
-        display_str = f":{client_id}"
+        # --- Nueva Lógica: Delegar al Launcher ---
+        request_file = "/tmp/vnc_request.tmp"
+        with open(request_file, 'w') as f:
+            f.write(str(client_id))
+        
+        logic.log_to_panel("Solicitud de sesión VNC enviada al launcher.", "info")
+        
+        # --- La lógica restante es la misma ---
         vnc_tcp_port = 5900 + client_id
         ws_port = random.randint(6001, 7000)
         vnc_password = secrets.token_hex(8)
         
+        # El launcher iniciará VNC, que leerá este archivo
         pass_file = f'/tmp/vnc_pass_{client_id}'; open(pass_file, 'w').write(vnc_password); os.chmod(pass_file, 0o600)
-
-        # --- Control del servicio systemd ---
-        service_name = f'vnc-session@{client_id}.service'
         
-        # Detener cualquier servicio VNC anterior
-        print(f"--- DEBUG: Intentando detener el servicio {service_name}")
-        subprocess.run(['sudo', '/bin/systemctl', 'stop', service_name])
+        # Esperar a que el servicio VNC se inicie
+        time.sleep(5) 
         
-        # Iniciar el nuevo servicio VNC vía systemd
-        print(f"--- DEBUG: Intentando iniciar el servicio {service_name}")
-        start_command = ['sudo', '/bin/systemctl', 'start', service_name]
-        result = subprocess.run(start_command, capture_output=True, text=True, timeout=10)
-        
-        if result.returncode != 0:
-            error_msg = f"Fallo al iniciar el servicio VNC. Stderr: {result.stderr} Stdout: {result.stdout}"
-            print(f"--- ERROR: {error_msg}")
-            logic.log_to_panel(error_msg, "error")
-            return jsonify({"msg": "Error interno al iniciar servicio VNC."}), 500
-        
-        print(f"--- DEBUG: Servicio {service_name} iniciado con éxito.")
-        logic.log_to_panel("Servicio VNC iniciado. Iniciando proxy y Chrome.", "info")
-        
-        # --- Iniciar Websockify y Chrome ---
         ws_cmd_str = f"/usr/bin/websockify {ws_port} localhost:{vnc_tcp_port}"
         ws_proc = subprocess.Popen(ws_cmd_str, shell=True)
-        active_sessions[client_id] = {'websockify': ws_proc} # Guardamos para limpiar
+        active_sessions[client_id] = {'websockify': ws_proc}
         
-        chrome_env = os.environ.copy(); chrome_env['DISPLAY'] = display_str
+        chrome_env = os.environ.copy(); chrome_env['DISPLAY'] = f":{client_id}"
         chrome_cmd_list = ['google-chrome', '--no-sandbox', '--disable-dev-shm-usage', f'--user-data-dir={logic.profile_path}', 'https://www.facebook.com']
         subprocess.Popen(chrome_cmd_list, env=chrome_env)
         
@@ -488,9 +479,8 @@ def init_facebook_login():
         error_log_message = f"Excepción CRÍTICA en init_facebook_login:\n--- TRACEBACK ---\n{tb_str}\n--- FIN TRACEBACK ---"
         print(error_log_message)
         if 'logic' in locals():
-            logic.log_to_panel("Ocurrió un error crítico en el servidor. Revisa los logs.", "error")
+            logic.log_to_panel("Ocurrió un error crítico en el servidor.", "error")
         return jsonify({"msg": "Excepción del servidor."}), 500
-    
 def admin_required(fn):
     """Decorador para proteger rutas de admin, requiere una clave de API en la cabecera."""
     @wraps(fn)
