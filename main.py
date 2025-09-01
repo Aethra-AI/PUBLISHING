@@ -436,47 +436,58 @@ def cleanup_all_sessions():
 atexit.register(cleanup_all_sessions)
 
 
+# En main.py
+
+# ... (asegúrate de tener 'import traceback' al principio) ...
+
 @app.route('/api/publishing/init-login', methods=['POST'])
 @jwt_required()
 def init_facebook_login():
     try:
         client_id = int(get_jwt().get('sub'))
         logic = instance_manager.get_logic(client_id)
-        if logic.is_publishing: return jsonify({"msg": "Publicación en curso."}), 409
-        
-        # Limpiar procesos de websockify anteriores
-        if client_id in active_sessions:
-            ws_proc = active_sessions.pop(client_id, {}).get('websockify')
-            if ws_proc and ws_proc.poll() is None: ws_proc.terminate()
-        
-        # --- Configuración ---
+        if logic.is_publishing:
+            return jsonify({"msg": "No se puede iniciar sesión mientras se publica."}), 409
+
+        # --- Puertos y Contraseña Predecibles ---
         vnc_tcp_port = 5900 + client_id
-        ws_port = random.randint(6001, 7000)
-        # Generamos una contraseña, pero no la usaremos para VNC, sino para el proxy
-        # Esta contraseña es lo que el usuario final usará para noVNC
-        vnc_password = secrets.token_hex(8)
+        ws_port = 6500 + client_id # Usamos el mismo mapeo que en la plantilla de websockify
+        vnc_password = "secret123"  # <-- ¡¡IMPORTANTE: PON AQUÍ LA CONTRASEÑA FIJA QUE CREASTE!!
 
-        # --- Crear un archivo de token para websockify ---
-        # Esta es la forma más segura de autenticar
-        token_file_path = f"/tmp/vnc_token_{client_id}"
-        with open(token_file_path, "w") as f:
-            # El formato es: token_unico: host_destino: puerto_destino
-            f.write(f"{vnc_password}: localhost:{vnc_tcp_port}")
+        # --- Nombres de los servicios a controlar ---
+        vnc_service = f'vnc-session@{client_id}.service'
+        ws_service = f'websockify@{client_id}.service' # Necesitaremos crear esta plantilla
         
-        # --- Delegar el inicio de VNC al Launcher ---
-        request_file = "/tmp/vnc_request.tmp"
-        with open(request_file, 'w') as f:
-            f.write(str(client_id))
-        logic.log_to_panel("Solicitud de sesión VNC enviada al launcher.", "info")
+        # --- Orquestación de Servicios con systemd ---
+        logic.log_to_panel(f"Deteniendo servicios anteriores para cliente {client_id}...", "info")
+        subprocess.run(['sudo', '/bin/systemctl', 'stop', ws_service])
+        subprocess.run(['sudo', '/bin/systemctl', 'stop', vnc_service])
+        
+        logic.log_to_panel(f"Iniciando nuevos servicios para cliente {client_id}...", "info")
+        
+        # Iniciar VNC
+        result_vnc = subprocess.run(['sudo', '/bin/systemctl', 'start', vnc_service], capture_output=True, text=True, timeout=15)
+        if result_vnc.returncode != 0:
+            error_msg = f"Fallo al iniciar el servicio VNC. Error: {result_vnc.stderr}"
+            print(error_msg)
+            logic.log_to_panel(error_msg, "error")
+            return jsonify({"msg": "Error interno al iniciar el escritorio virtual."}), 500
+            
+        # Esperar un momento para que VNC esté listo
+        time.sleep(2)
 
-        # Esperar a que el launcher y systemd inicien el servidor VNC
-        time.sleep(5) 
-        
-        # --- Iniciar websockify con autenticación por token ---
-        ws_cmd_str = f"/usr/bin/websockify {ws_port} --token-plugin VncAuth --token-source {token_file_path}"
-        ws_proc = subprocess.Popen(ws_cmd_str, shell=True)
-        active_sessions[client_id] = {'websockify': ws_proc}
-        
+        # Iniciar Websockify
+        result_ws = subprocess.run(['sudo', '/bin/systemctl', 'start', ws_service], capture_output=True, text=True, timeout=10)
+        if result_ws.returncode != 0:
+            error_msg = f"Fallo al iniciar el proxy websockify. Error: {result_ws.stderr}"
+            print(error_msg)
+            logic.log_to_panel(error_msg, "error")
+            # Detener el servicio VNC si el proxy falla
+            subprocess.run(['sudo', '/bin/systemctl', 'stop', vnc_service])
+            return jsonify({"msg": "Error interno al iniciar el proxy de conexión."}), 500
+
+        logic.log_to_panel("Entorno de login remoto listo y en espera.", "success")
+
         return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
     except Exception:
@@ -486,7 +497,6 @@ def init_facebook_login():
         if 'logic' in locals():
             logic.log_to_panel("Ocurrió un error crítico en el servidor.", "error")
         return jsonify({"msg": "Excepción del servidor."}), 500
-    
     
     
     
