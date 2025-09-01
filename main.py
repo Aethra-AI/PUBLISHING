@@ -460,13 +460,12 @@ def init_facebook_login():
         
         # --- Orquestación de Servicios con systemd ---
         logic.log_to_panel(f"Deteniendo servicios anteriores para cliente {client_id}...", "info")
-        subprocess.run(['sudo', '/bin/systemctl', 'stop', ws_service])
-        subprocess.run(['sudo', '/bin/systemctl', 'stop', vnc_service])
-        
+        subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'stop', ws_service])
+        subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'stop', vnc_service])     
         logic.log_to_panel(f"Iniciando nuevos servicios para cliente {client_id}...", "info")
         
         # Iniciar VNC
-        result_vnc = subprocess.run(['sudo', '/bin/systemctl', 'start', vnc_service], capture_output=True, text=True, timeout=15)
+        result_vnc = subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'start', vnc_service], capture_output=True, text=True, timeout=15)
         if result_vnc.returncode != 0:
             error_msg = f"Fallo al iniciar el servicio VNC. Error: {result_vnc.stderr}"
             print(error_msg)
@@ -477,7 +476,7 @@ def init_facebook_login():
         time.sleep(2)
 
         # Iniciar Websockify
-        result_ws = subprocess.run(['sudo', '/bin/systemctl', 'start', ws_service], capture_output=True, text=True, timeout=10)
+        result_ws = subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'start', ws_service], capture_output=True, text=True, timeout=10)
         if result_ws.returncode != 0:
             error_msg = f"Fallo al iniciar el proxy websockify. Error: {result_ws.stderr}"
             print(error_msg)
