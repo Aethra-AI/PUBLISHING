@@ -436,9 +436,8 @@ def cleanup_all_sessions():
 atexit.register(cleanup_all_sessions)
 
 
-# En main.py
 
-# ... (asegúrate de tener 'import traceback' al principio) ...
+# ... (asegúrate de tener 'import os' y 'import subprocess' al principio) ...
 
 @app.route('/api/publishing/init-login', methods=['POST'])
 @jwt_required()
@@ -455,21 +454,35 @@ def init_facebook_login():
         
         subprocess.run(['sudo', '/bin/systemctl', 'stop', ws_service])
         subprocess.run(['sudo', '/bin/systemctl', 'stop', vnc_service])
-        
-        result_vnc = subprocess.run(['sudo', '/bin/systemctl', 'start', vnc_service], capture_output=True, text=True, timeout=15)
-        if result_vnc.returncode != 0:
-            error_msg = f"Fallo al iniciar VNC. Stderr: {result_vnc.stderr}"
-            print(f"Error VNC: {error_msg}")
-            return jsonify({"msg": "Error al iniciar VNC."}), 500
-        
-        time.sleep(1) # Pequeña pausa
 
-        result_ws = subprocess.run(['sudo', '/bin/systemctl', 'start', ws_service], capture_output=True, text=True, timeout=10)
-        if result_ws.returncode != 0:
-            error_msg = f"Fallo al iniciar Websockify. Stderr: {result_ws.stderr}"
-            print(f"Error Websockify: {error_msg}")
-            subprocess.run(['sudo', '/bin/systemctl', 'stop', vnc_service])
-            return jsonify({"msg": "Error al iniciar el proxy."}), 500
+        # Modificación clave: Ejecutar el script de inicio en background y esperar la conexión
+        script_path = os.path.abspath("start_vnc_session.sh")
+        cmd = ["sudo", script_path, str(client_id), str(ws_port), vnc_password]
+
+        # Ejecutar el script en background
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Monitorear el script hasta que VNC esté listo o haya un timeout
+        start_time = time.time()
+        timeout = 30  # Ajustar según sea necesario
+        vnc_ready = False
+        
+        while time.time() - start_time < timeout:
+            line = process.stdout.readline()
+            if line:
+                log_output = line.decode().strip()
+                print(f"Script de inicio: {log_output}")  # Para depuración
+                if "VNC server started" in log_output:
+                    vnc_ready = True
+                    break  # VNC listo, salir del loop
+            time.sleep(1)
+        
+        # Comprobar si hubo un error o timeout
+        if not vnc_ready:
+            process.terminate()
+            stderr_output = process.stderr.read().decode().strip()
+            print(f"Error al iniciar VNC: {stderr_output}")
+            return jsonify({"msg": "Error al iniciar VNC (timeout o error interno). Revise los logs del servidor."}), 500
 
         return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
@@ -477,8 +490,7 @@ def init_facebook_login():
         # Tu bloque de traceback mejorado
         tb_str = traceback.format_exc()
         print(f"Excepción CRÍTICA en init_facebook_login:\n{tb_str}")
-        return jsonify({"msg": "Excepción del servidor."}), 500
-    
+        return jsonify({"msg": "Excepción del servidor."}), 500    
     
     
 def admin_required(fn):
