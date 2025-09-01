@@ -441,26 +441,39 @@ atexit.register(cleanup_all_sessions)
 def init_facebook_login():
     try:
         client_id = int(get_jwt().get('sub'))
+        logic = instance_manager.get_logic(client_id)
+        if logic.is_publishing: return jsonify({"msg": "Publicación en curso."}), 409
+        
+        # Limpiar procesos de websockify anteriores
         if client_id in active_sessions:
             ws_proc = active_sessions.pop(client_id, {}).get('websockify')
             if ws_proc and ws_proc.poll() is None: ws_proc.terminate()
         
-        # --- CAMBIOS AQUÍ ---
+        # --- Configuración ---
         vnc_tcp_port = 5900 + client_id
         ws_port = random.randint(6001, 7000)
-        # La contraseña ahora es fija, la que creaste con vncpasswd
-        vnc_password = "Nc044700.JS" # <-- ¡¡PON AQUÍ LA CONTRASEÑA QUE CREASTE!!
+        # Generamos una contraseña, pero no la usaremos para VNC, sino para el proxy
+        # Esta contraseña es lo que el usuario final usará para noVNC
+        vnc_password = secrets.token_hex(8)
 
-        service_name = f'vnc-session@{client_id}.service'
-        subprocess.run(['sudo', '/bin/systemctl', 'stop', service_name])
-        result = subprocess.run(['sudo', '/bin/systemctl', 'start', service_name], capture_output=True, text=True, timeout=10)
+        # --- Crear un archivo de token para websockify ---
+        # Esta es la forma más segura de autenticar
+        token_file_path = f"/tmp/vnc_token_{client_id}"
+        with open(token_file_path, "w") as f:
+            # El formato es: token_unico: host_destino: puerto_destino
+            f.write(f"{vnc_password}: localhost:{vnc_tcp_port}")
         
-        if result.returncode != 0:
-            error_msg = f"Fallo al iniciar VNC. Stderr: {result.stderr}"
-            print(f"--- ERROR: {error_msg}")
-            return jsonify({"msg": "Error interno al iniciar VNC."}), 500
+        # --- Delegar el inicio de VNC al Launcher ---
+        request_file = "/tmp/vnc_request.tmp"
+        with open(request_file, 'w') as f:
+            f.write(str(client_id))
+        logic.log_to_panel("Solicitud de sesión VNC enviada al launcher.", "info")
+
+        # Esperar a que el launcher y systemd inicien el servidor VNC
+        time.sleep(5) 
         
-        ws_cmd_str = f"/usr/bin/websockify {ws_port} localhost:{vnc_tcp_port}"
+        # --- Iniciar websockify con autenticación por token ---
+        ws_cmd_str = f"/usr/bin/websockify {ws_port} --token-plugin VncAuth --token-source {token_file_path}"
         ws_proc = subprocess.Popen(ws_cmd_str, shell=True)
         active_sessions[client_id] = {'websockify': ws_proc}
         
@@ -468,7 +481,10 @@ def init_facebook_login():
 
     except Exception:
         tb_str = traceback.format_exc()
-        print(f"Excepción CRÍTICA en init_facebook_login:\n{tb_str}")
+        error_log_message = f"Excepción CRÍTICA en init_facebook_login:\n--- TRACEBACK ---\n{tb_str}\n--- FIN TRACEBACK ---"
+        print(error_log_message)
+        if 'logic' in locals():
+            logic.log_to_panel("Ocurrió un error crítico en el servidor.", "error")
         return jsonify({"msg": "Excepción del servidor."}), 500
     
     
