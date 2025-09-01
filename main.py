@@ -445,56 +445,38 @@ atexit.register(cleanup_all_sessions)
 def init_facebook_login():
     try:
         client_id = int(get_jwt().get('sub'))
-        logic = instance_manager.get_logic(client_id)
-        if logic.is_publishing:
-            return jsonify({"msg": "No se puede iniciar sesión mientras se publica."}), 409
+        
+        # --- Puertos PREDECIBLES según la nueva regla ---
+        ws_port = 6500 + client_id
+        vnc_password = "secret123" # <-- ¡PON AQUÍ TU CONTRASEÑA FIJA!
 
-        # --- Puertos y Contraseña Predecibles ---
-        vnc_tcp_port = 5900 + client_id
-        ws_port = 6500 + client_id # Usamos el mismo mapeo que en la plantilla de websockify
-        vnc_password = "secret123"  # <-- ¡¡IMPORTANTE: PON AQUÍ LA CONTRASEÑA FIJA QUE CREASTE!!
-
-        # --- Nombres de los servicios a controlar ---
         vnc_service = f'vnc-session@{client_id}.service'
-        ws_service = f'websockify@{client_id}.service' # Necesitaremos crear esta plantilla
+        ws_service = f'websockify@{client_id}.service'
         
-        # --- Orquestación de Servicios con systemd ---
-        logic.log_to_panel(f"Deteniendo servicios anteriores para cliente {client_id}...", "info")
-        subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'stop', ws_service])
-        subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'stop', vnc_service])     
-        logic.log_to_panel(f"Iniciando nuevos servicios para cliente {client_id}...", "info")
+        subprocess.run(['sudo', '/bin/systemctl', 'stop', ws_service])
+        subprocess.run(['sudo', '/bin/systemctl', 'stop', vnc_service])
         
-        # Iniciar VNC
-        result_vnc = subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'start', vnc_service], capture_output=True, text=True, timeout=15)
+        result_vnc = subprocess.run(['sudo', '/bin/systemctl', 'start', vnc_service], capture_output=True, text=True, timeout=15)
         if result_vnc.returncode != 0:
-            error_msg = f"Fallo al iniciar el servicio VNC. Error: {result_vnc.stderr}"
-            print(error_msg)
-            logic.log_to_panel(error_msg, "error")
-            return jsonify({"msg": "Error interno al iniciar el escritorio virtual."}), 500
-            
-        # Esperar un momento para que VNC esté listo
-        time.sleep(2)
+            error_msg = f"Fallo al iniciar VNC. Stderr: {result_vnc.stderr}"
+            print(f"Error VNC: {error_msg}")
+            return jsonify({"msg": "Error al iniciar VNC."}), 500
+        
+        time.sleep(1) # Pequeña pausa
 
-        # Iniciar Websockify
-        result_ws = subprocess.run(['/usr/bin/sudo', '/bin/systemctl', 'start', ws_service], capture_output=True, text=True, timeout=10)
+        result_ws = subprocess.run(['sudo', '/bin/systemctl', 'start', ws_service], capture_output=True, text=True, timeout=10)
         if result_ws.returncode != 0:
-            error_msg = f"Fallo al iniciar el proxy websockify. Error: {result_ws.stderr}"
-            print(error_msg)
-            logic.log_to_panel(error_msg, "error")
-            # Detener el servicio VNC si el proxy falla
+            error_msg = f"Fallo al iniciar Websockify. Stderr: {result_ws.stderr}"
+            print(f"Error Websockify: {error_msg}")
             subprocess.run(['sudo', '/bin/systemctl', 'stop', vnc_service])
-            return jsonify({"msg": "Error interno al iniciar el proxy de conexión."}), 500
-
-        logic.log_to_panel("Entorno de login remoto listo y en espera.", "success")
+            return jsonify({"msg": "Error al iniciar el proxy."}), 500
 
         return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
     except Exception:
+        # Tu bloque de traceback mejorado
         tb_str = traceback.format_exc()
-        error_log_message = f"Excepción CRÍTICA en init_facebook_login:\n--- TRACEBACK ---\n{tb_str}\n--- FIN TRACEBACK ---"
-        print(error_log_message)
-        if 'logic' in locals():
-            logic.log_to_panel("Ocurrió un error crítico en el servidor.", "error")
+        print(f"Excepción CRÍTICA en init_facebook_login:\n{tb_str}")
         return jsonify({"msg": "Excepción del servidor."}), 500
     
     
