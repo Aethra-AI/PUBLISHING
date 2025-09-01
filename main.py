@@ -461,7 +461,7 @@ def init_facebook_login():
         
         # Esperamos a que el launcher y systemd hagan su trabajo
         # Este tiempo es crucial para que el puerto VNC esté disponible
-        time.sleep(5)
+        time.sleep(10)
         
         # --- Iniciar websockify (esto sí lo puede hacer Flask) ---
         ws_cmd_str = f"/usr/bin/websockify {ws_port} localhost:{vnc_tcp_port}"
