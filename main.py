@@ -441,49 +441,36 @@ atexit.register(cleanup_all_sessions)
 def init_facebook_login():
     try:
         client_id = int(get_jwt().get('sub'))
-        logic = instance_manager.get_logic(client_id)
-        if logic.is_publishing: return jsonify({"msg": "Publicación en curso."}), 409
+        if client_id in active_sessions:
+            ws_proc = active_sessions.pop(client_id, {}).get('websockify')
+            if ws_proc and ws_proc.poll() is None: ws_proc.terminate()
         
-        # --- Lógica de Delegación al Launcher ---
-        request_file = "/tmp/vnc_request.tmp"
-        with open(request_file, 'w') as f:
-            f.write(str(client_id))
-        
-        logic.log_to_panel("Solicitud de sesión VNC enviada al launcher.", "info")
-        
-        # --- Lógica Restante ---
+        # --- CAMBIOS AQUÍ ---
         vnc_tcp_port = 5900 + client_id
         ws_port = random.randint(6001, 7000)
-        vnc_password = secrets.token_hex(8)
+        # La contraseña ahora es fija, la que creaste con vncpasswd
+        vnc_password = "Nc044700.JS" # <-- ¡¡PON AQUÍ LA CONTRASEÑA QUE CREASTE!!
+
+        service_name = f'vnc-session@{client_id}.service'
+        subprocess.run(['sudo', '/bin/systemctl', 'stop', service_name])
+        result = subprocess.run(['sudo', '/bin/systemctl', 'start', service_name], capture_output=True, text=True, timeout=10)
         
-        # El launcher iniciará VNC, que leerá este archivo de contraseña
-        open(f'/tmp/vnc_pass_{client_id}', 'w').write(vnc_password); os.chmod(f'/tmp/vnc_pass_{client_id}', 0o600)
+        if result.returncode != 0:
+            error_msg = f"Fallo al iniciar VNC. Stderr: {result.stderr}"
+            print(f"--- ERROR: {error_msg}")
+            return jsonify({"msg": "Error interno al iniciar VNC."}), 500
         
-        # Esperamos a que el launcher y systemd hagan su trabajo
-        # Este tiempo es crucial para que el puerto VNC esté disponible
-        time.sleep(10)
-        
-        # --- Iniciar websockify (esto sí lo puede hacer Flask) ---
         ws_cmd_str = f"/usr/bin/websockify {ws_port} localhost:{vnc_tcp_port}"
         ws_proc = subprocess.Popen(ws_cmd_str, shell=True)
-        
-        # Limpiar websockify de sesiones anteriores y guardar el nuevo
-        if client_id in active_sessions:
-            old_ws_proc = active_sessions.pop(client_id, {}).get('websockify')
-            if old_ws_proc and old_ws_proc.poll() is None: old_ws_proc.terminate()
         active_sessions[client_id] = {'websockify': ws_proc}
-        
-        # ¡NO INICIAMOS CHROME AQUÍ! Lo hace systemd.
         
         return jsonify({"msg": "Entorno listo.", "proxy_port": ws_port, "vnc_password": vnc_password})
 
     except Exception:
         tb_str = traceback.format_exc()
-        error_log_message = f"Excepción CRÍTICA en init_facebook_login:\n--- TRACEBACK ---\n{tb_str}\n--- FIN TRACEBACK ---"
-        print(error_log_message)
-        if 'logic' in locals():
-            logic.log_to_panel("Ocurrió un error crítico en el servidor.", "error")
+        print(f"Excepción CRÍTICA en init_facebook_login:\n{tb_str}")
         return jsonify({"msg": "Excepción del servidor."}), 500
+    
     
     
     
